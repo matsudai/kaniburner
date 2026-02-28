@@ -1,0 +1,8 @@
+[submodule "components/emsdk"]
+	path = components/emsdk
+	url = https://github.com/emscripten-core/emsdk.git
+	ignore = dirty
+[submodule "components/mruby"]
+	path = components/mruby
+	url = https://github.com/mruby/mruby.git
+	ignore = dirty

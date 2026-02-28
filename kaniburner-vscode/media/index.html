@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>kaniburner</title>
+  <link rel="icon" type="image/svg+xml" href="favicon.svg">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <h1>kaniburner</h1>
+
+  <!-- メイン: ボード選択 + 接続アイコン -->
+  <section id="mainSection">
+    <select id="boardSelect">
+      <option value="">-- ボードを選択 --</option>
+      <option value="rboard">RBoard</option>
+      <option value="esp32">ESP32</option>
+      <option value="kani">Raspberry Pi Pico (RP2040)</option>
+    </select>
+    <div id="cableIcon" class="cable-icon" title="接続"></div>
+  </section>
+
+  <!-- Debug アコーディオン -->
+  <details id="debugDetails">
+    <summary>Debug</summary>
+
+    <section>
+      <label>Ruby Code:</label>
+      <textarea id="codeEditor" rows="8" readonly>puts "Hello, mruby!"</textarea>
+      <div>
+        <button id="btnCompile">コンパイル</button>
+        <button id="btnRunMruby">mrubyで実行</button>
+      </div>
+    </section>
+
+    <section>
+      <label>Log:</label>
+      <div id="logArea"></div>
+      <div>
+        <button id="btnClearLog">Clear Log</button>
+      </div>
+    </section>
+
+    <section>
+      <div>
+        <button id="btnConnect">接続</button>
+        <button id="btnDisconnect">切断</button>
+        <button id="btnWrite">書き込み</button>
+        <button id="btnExecute">実行</button>
+      </div>
+    </section>
+
+    <section>
+      <label>コマンド:</label>
+      <input id="commandInput" list="commandList" placeholder="version">
+      <datalist id="commandList">
+        <option value="version">
+        <option value="clear">
+        <option value="write">
+        <option value="execute">
+        <option value="reset">
+        <option value="help">
+        <option value="showprog">
+      </datalist>
+      <button id="btnSend">Send</button>
+    </section>
+
+    <section>
+      <label>Devices:</label>
+      <div id="deviceList"></div>
+    </section>
+  </details>
+
+  <script src="mrbc"></script>
+  <script src="mruby"></script>
+  <script src="app.js"></script>
+</body>
+</html>

@@ -1,0 +1,79 @@
+body {
+  font-family: monospace;
+  max-width: 720px;
+  margin: 0 auto;
+  padding: 16px;
+  background: #fafafa;
+  color: #222;
+}
+
+section {
+  padding: 12px 0;
+  border-bottom: 1px solid #ddd;
+}
+
+label {
+  display: block;
+  font-weight: bold;
+  margin-bottom: 4px;
+}
+
+#codeEditor {
+  width: 100%;
+  font-family: monospace;
+  tab-size: 2;
+  resize: vertical;
+  box-sizing: border-box;
+}
+
+#logArea {
+  height: 200px;
+  overflow-y: auto;
+  background: #1e1e1e;
+  color: #d4d4d4;
+  white-space: pre-wrap;
+  font-family: monospace;
+  padding: 8px;
+  box-sizing: border-box;
+  border-radius: 4px;
+  margin-bottom: 8px;
+}
+
+.log-info {
+  color: #3fb950;
+}
+
+.log-error {
+  color: #f85149;
+}
+
+.log-raw {
+  color: #d4d4d4;
+}
+
+#btnConnect {
+  color: #1a7f37;
+}
+
+#btnDisconnect {
+  color: #cf222e;
+}
+
+button:disabled {
+  opacity: 0.5;
+}
+
+#commandInput {
+  font-family: monospace;
+}
+
+.device-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 2px 0;
+}
+
+.device-item button {
+  color: #cf222e;
+}

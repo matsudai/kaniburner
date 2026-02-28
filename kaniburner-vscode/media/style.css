@@ -1,0 +1,145 @@
+body {
+  font-family: monospace;
+  max-width: 720px;
+  margin: 0 auto;
+  padding: 16px;
+  background: #fafafa;
+  color: #222;
+}
+
+section {
+  padding: 12px 0;
+  border-bottom: 1px solid #ddd;
+}
+
+label {
+  display: block;
+  font-weight: bold;
+  margin-bottom: 4px;
+}
+
+#codeEditor {
+  width: 100%;
+  font-family: monospace;
+  tab-size: 2;
+  resize: vertical;
+  box-sizing: border-box;
+}
+
+#logArea {
+  height: 200px;
+  overflow-y: auto;
+  background: #1e1e1e;
+  color: #d4d4d4;
+  white-space: pre-wrap;
+  font-family: monospace;
+  padding: 8px;
+  box-sizing: border-box;
+  border-radius: 4px;
+  margin-bottom: 8px;
+}
+
+.log-info {
+  color: #3fb950;
+}
+
+.log-error {
+  color: #f85149;
+}
+
+.log-raw {
+  color: #d4d4d4;
+}
+
+#btnConnect {
+  color: #1a7f37;
+}
+
+#btnDisconnect {
+  color: #cf222e;
+}
+
+button:disabled {
+  opacity: 0.5;
+}
+
+#commandInput {
+  font-family: monospace;
+}
+
+.device-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 2px 0;
+}
+
+.device-item button {
+  color: #cf222e;
+}
+
+#mainSection {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 24px;
+  padding: 32px 0;
+}
+
+.cable-icon {
+  width: 96px;
+  height: 96px;
+  background-color: #888;
+  -webkit-mask-image: url('cable.svg');
+  mask-image: url('cable.svg');
+  -webkit-mask-size: contain;
+  mask-size: contain;
+  -webkit-mask-repeat: no-repeat;
+  mask-repeat: no-repeat;
+  -webkit-mask-position: center;
+  mask-position: center;
+  cursor: pointer;
+  transition: background-color 0.2s;
+}
+
+.cable-icon.disabled {
+  background-color: #ccc;
+  cursor: default;
+  pointer-events: none;
+}
+
+.cable-icon:hover {
+  background-color: #555;
+}
+
+.cable-icon.connected {
+  background-color: #3fb950;
+}
+
+.cable-icon.connected:hover {
+  background-color: #2ea043;
+}
+
+#debugDetails {
+  border: 1px solid #ddd;
+  border-radius: 4px;
+  margin-top: 16px;
+}
+
+#debugDetails summary {
+  padding: 8px 12px;
+  cursor: pointer;
+  font-weight: bold;
+  background: #f0f0f0;
+  border-radius: 4px;
+}
+
+#debugDetails[open] summary {
+  border-bottom: 1px solid #ddd;
+  border-radius: 4px 4px 0 0;
+}
+
+#debugDetails > section {
+  padding: 12px;
+}

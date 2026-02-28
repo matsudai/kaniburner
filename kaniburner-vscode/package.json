@@ -1,0 +1,133 @@
+{
+  "name": "kaniburner",
+  "displayName": "Kaniburner",
+  "version": "0.0.3",
+  "description": "mruby compiler and mrbwrite writer",
+  "publisher": "matsudai",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/matsudai/kaniburner"
+  },
+  "main": "./src/extension.js",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "activationEvents": [],
+  "contributes": {
+    "commands": [
+      {
+        "command": "kaniburner.executeAll",
+        "title": "Kaniburner: Execute All",
+        "icon": "$(rocket)"
+      },
+      {
+        "command": "kaniburner.serve",
+        "title": "Kaniburner: Serve",
+        "icon": "$(broadcast)"
+      },
+      {
+        "command": "kaniburner.edit",
+        "title": "Kaniburner: Edit",
+        "icon": "$(edit)"
+      },
+      {
+        "command": "kaniburner.compile",
+        "title": "Kaniburner: Compile",
+        "icon": "$(file-binary)"
+      },
+      {
+        "command": "kaniburner.write",
+        "title": "Kaniburner: Write",
+        "icon": "$(desktop-download)"
+      },
+      {
+        "command": "kaniburner.execute",
+        "title": "Kaniburner: Execute",
+        "icon": "$(run-all)"
+      },
+      {
+        "command": "kaniburner.run",
+        "title": "Kaniburner: Run mruby",
+        "icon": "$(play)"
+      },
+      {
+        "command": "kaniburner.connect",
+        "title": "Kaniburner: Connect",
+        "icon": "$(plug)"
+      },
+      {
+        "command": "kaniburner.disconnect",
+        "title": "Kaniburner: Disconnect",
+        "icon": "$(debug-disconnect)"
+      }
+    ],
+    "submenus": [
+      {
+        "id": "kaniburner.submenu",
+        "label": "Kaniburner",
+        "icon": "$(circuit-board)"
+      }
+    ],
+    "menus": {
+      "editor/title": [
+        {
+          "command": "kaniburner.executeAll",
+          "group": "navigation@1",
+          "when": "resourceExtname == .rb && kaniburner.wsConnected && kaniburner.deviceConnected"
+        },
+        {
+          "submenu": "kaniburner.submenu",
+          "group": "navigation@2",
+          "when": "resourceExtname == .rb"
+        }
+      ],
+      "kaniburner.submenu": [
+        {
+          "command": "kaniburner.serve",
+          "group": "1_serve",
+          "when": "!kaniburner.wsConnected"
+        },
+        {
+          "command": "kaniburner.executeAll",
+          "group": "2_all",
+          "when": "kaniburner.wsConnected && kaniburner.deviceConnected"
+        },
+        {
+          "command": "kaniburner.edit",
+          "group": "3_steps",
+          "when": "kaniburner.wsConnected"
+        },
+        {
+          "command": "kaniburner.compile",
+          "group": "3_steps",
+          "when": "kaniburner.wsConnected"
+        },
+        {
+          "command": "kaniburner.write",
+          "group": "3_steps",
+          "when": "kaniburner.wsConnected && kaniburner.deviceConnected"
+        },
+        {
+          "command": "kaniburner.execute",
+          "group": "3_steps",
+          "when": "kaniburner.wsConnected && kaniburner.deviceConnected"
+        },
+        {
+          "command": "kaniburner.run",
+          "group": "4_mruby",
+          "when": "kaniburner.wsConnected"
+        },
+        {
+          "command": "kaniburner.disconnect",
+          "group": "5_serial",
+          "when": "kaniburner.wsConnected && kaniburner.deviceConnected"
+        }
+      ]
+    }
+  },
+  "dependencies": {
+    "@hono/node-server": "^1.19.9",
+    "@hono/node-ws": "^1.3.0",
+    "hono": "^4.12.3"
+  }
+}
