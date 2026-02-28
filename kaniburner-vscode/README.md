@@ -2,7 +2,7 @@
 
 Cross platform mruby compiler and mrb writer.
 
-![](https://github.com/matsudai/kaniburner/blob/main/docs/images/readme.gif)
+![](https://raw.githubusercontent.com/matsudai/kaniburner/refs/heads/main/docs/images/readme.gif)
 
 ## Requirements
 
