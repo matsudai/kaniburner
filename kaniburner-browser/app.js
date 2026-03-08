@@ -516,6 +516,7 @@
         btnConnect: document.getElementById('btnConnect'),
         btnDisconnect: document.getElementById('btnDisconnect'),
         btnSend: document.getElementById('btnSend'),
+        btnBreak: document.getElementById('btnBreak'),
         deviceList: document.getElementById('deviceList')
       };
 
@@ -553,6 +554,7 @@
       this.els.btnConnect.addEventListener('click', () => this.handleConnect());
       this.els.btnDisconnect.addEventListener('click', () => this.handleDisconnect());
       this.els.btnSend.addEventListener('click', () => this.handleSend());
+      this.els.btnBreak.addEventListener('click', () => this.handleBreak());
       this.els.commandInput.addEventListener('keydown', (e) => {
         if (e.key === 'Enter') this.els.btnSend.click();
       });
@@ -581,6 +583,7 @@
       this.els.btnWrite.disabled = !(conn && this.compiledBinary);
       this.els.btnVerify.disabled = !(conn && this.compiledBinary);
       this.els.btnExecute.disabled = !conn;
+      this.els.btnBreak.disabled = !conn;
       this.els.btnSend.disabled = !conn;
     },
 
@@ -689,6 +692,24 @@
     async handleDisconnect() {
       this.logInfo('Disconnecting...');
       await SerialComm.disconnect();
+    },
+
+    /** Breakボタンのハンドラ */
+    async handleBreak() {
+      if (!SerialComm.connected) {
+        this.logError('Not connected.');
+        return;
+      }
+      this.logInfo('Sending break signal...');
+      try {
+        await SerialComm.port.setSignals({ break: true });
+        await sleep(100);
+        await SerialComm.port.setSignals({ break: false });
+        this.logInfo('Break signal sent.');
+      } catch (e) {
+        console.warn('Break signal error:', e);
+        this.logError('Break signal failed: ' + e.message);
+      }
     },
 
     /** コマンド送信ボタンのハンドラ */
