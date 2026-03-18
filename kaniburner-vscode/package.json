@@ -51,6 +51,11 @@
         "icon": "$(play)"
       },
       {
+        "command": "kaniburner.break",
+        "title": "Kaniburner: Break",
+        "icon": "$(debug-pause)"
+      },
+      {
         "command": "kaniburner.connect",
         "title": "Kaniburner: Connect",
         "icon": "$(plug)"
@@ -116,6 +121,11 @@
           "command": "kaniburner.run",
           "group": "4_mruby",
           "when": "kaniburner.wsConnected"
+        },
+        {
+          "command": "kaniburner.break",
+          "group": "5_serial",
+          "when": "kaniburner.wsConnected && kaniburner.deviceConnected"
         },
         {
           "command": "kaniburner.disconnect",

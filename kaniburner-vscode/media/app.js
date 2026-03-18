@@ -268,6 +268,20 @@
      */
     async sendBinary(data) {
       await this.writeToPort(data);
+    },
+
+    /**
+     * シリアルポートにBreak信号を送信する
+     */
+    async sendBreak() {
+      if (!this.port) return;
+      try {
+        await this.port.setSignals({ break: true });
+        await sleep(100);
+        await this.port.setSignals({ break: false });
+      } catch (e) {
+        console.warn('sendBreak:', e);
+      }
     }
   };
 
@@ -479,6 +493,7 @@
         btnConnect: document.getElementById('btnConnect'),
         btnDisconnect: document.getElementById('btnDisconnect'),
         btnSend: document.getElementById('btnSend'),
+        btnBreak: document.getElementById('btnBreak'),
         deviceList: document.getElementById('deviceList'),
         cableIcon: document.getElementById('cableIcon')
       };
@@ -521,6 +536,7 @@
       this.els.btnConnect.addEventListener('click', () => this.handleConnect());
       this.els.btnDisconnect.addEventListener('click', () => this.handleDisconnect());
       this.els.btnSend.addEventListener('click', () => this.handleSend());
+      this.els.btnBreak.addEventListener('click', () => this.handleBreak());
       this.els.commandInput.addEventListener('keydown', (e) => {
         if (e.key === 'Enter') this.els.btnSend.click();
       });
@@ -566,6 +582,9 @@
           case 'execute':
             await this.handleExecute();
             break;
+          case 'break':
+            await this.handleBreak();
+            break;
           case 'executeAll':
             this.els.codeEditor.value = msg.content ?? '';
             this.handleCompile();
@@ -590,6 +609,7 @@
       this.els.btnDisconnect.disabled = !conn;
       this.els.btnWrite.disabled = !(conn && this.compiledBinary);
       this.els.btnExecute.disabled = !conn;
+      this.els.btnBreak.disabled = !conn;
       this.els.btnSend.disabled = !conn;
 
       const cableActive = conn || (serial && ready && board);
@@ -682,6 +702,12 @@
     /** 実行ボタンのハンドラ */
     async handleExecute() {
       await MrbwriteProtocol.executeProgram();
+    },
+
+    /** Breakボタンのハンドラ */
+    async handleBreak() {
+      this.logInfo('> break');
+      await SerialComm.sendBreak();
     },
 
     /** ログクリアボタンのハンドラ */

@@ -181,6 +181,12 @@ const activate = (context) => {
       broadcast({ type: "execute" });
     })
   );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand("kaniburner.break", () => {
+      broadcast({ type: "break" });
+    })
+  );
 };
 
 /**
