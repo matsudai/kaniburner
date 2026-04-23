@@ -1,0 +1,16 @@
+.vscode/**
+.gitignore
+.vscodeignore
+.npm.stamp
+Makefile
+build_config/**
+**/*.map
+**/.eslintrc*
+*.vsix
+node_modules/**/*.md
+node_modules/**/*.ts
+node_modules/**/test/**
+node_modules/**/tests/**
+node_modules/**/example/**
+node_modules/**/examples/**
+node_modules/**/.github/**

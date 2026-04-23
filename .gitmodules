@@ -6,3 +6,11 @@
 	path = components/mruby
 	url = https://github.com/mruby/mruby.git
 	ignore = dirty
+[submodule "components/mruby-3.4"]
+	path = components/mruby-3.4
+	url = https://github.com/mruby/mruby.git
+	ignore = dirty
+[submodule "components/mruby-4.0"]
+	path = components/mruby-4.0
+	url = https://github.com/mruby/mruby.git
+	ignore = dirty

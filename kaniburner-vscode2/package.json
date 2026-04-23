@@ -1,0 +1,80 @@
+{
+  "name": "kaniburner",
+  "displayName": "Kaniburner",
+  "version": "0.0.5",
+  "description": "mruby compiler and mrbwrite writer",
+  "publisher": "matsudai",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/matsudai/kaniburner"
+  },
+  "main": "./src/extension.js",
+  "engines": {
+    "vscode": "^1.86.0"
+  },
+  "activationEvents": [],
+  "contributes": {
+    "configuration": {
+      "title": "Kaniburner",
+      "properties": {
+        "kaniburner.board": {
+          "type": "string",
+          "enum": ["rboard", "esp32", "kani"],
+          "enumDescriptions": [
+            "RBoard (19200 baud)",
+            "ESP32 (115200 baud)",
+            "Raspberry Pi Pico / RP2040 (19200 baud)"
+          ],
+          "default": "rboard",
+          "description": "Target board profile."
+        },
+        "kaniburner.mrubyVersion": {
+          "type": "string",
+          "enum": ["3.4", "4.0"],
+          "default": "3.4",
+          "description": "mruby version used for compilation and local execution (loads media/mruby-<version>/)."
+        }
+      }
+    },
+    "commands": [
+      { "command": "kaniburner.executeAll", "title": "Kaniburner: Execute All", "icon": "$(rocket)" },
+      { "command": "kaniburner.compile",    "title": "Kaniburner: Compile",     "icon": "$(file-binary)" },
+      { "command": "kaniburner.write",      "title": "Kaniburner: Write",       "icon": "$(desktop-download)" },
+      { "command": "kaniburner.execute",    "title": "Kaniburner: Execute",     "icon": "$(run-all)" },
+      { "command": "kaniburner.run",        "title": "Kaniburner: Run mruby",   "icon": "$(play)" },
+      { "command": "kaniburner.break",      "title": "Kaniburner: Break",       "icon": "$(debug-pause)" },
+      { "command": "kaniburner.connect",    "title": "Kaniburner: Connect",     "icon": "$(plug)" },
+      { "command": "kaniburner.disconnect", "title": "Kaniburner: Disconnect",  "icon": "$(debug-disconnect)" }
+    ],
+    "submenus": [
+      { "id": "kaniburner.submenu", "label": "Kaniburner", "icon": "$(circuit-board)" }
+    ],
+    "menus": {
+      "editor/title": [
+        {
+          "command": "kaniburner.executeAll",
+          "group": "navigation@1",
+          "when": "resourceExtname == .rb && kaniburner.deviceConnected"
+        },
+        {
+          "submenu": "kaniburner.submenu",
+          "group": "navigation@2",
+          "when": "resourceExtname == .rb"
+        }
+      ],
+      "kaniburner.submenu": [
+        { "command": "kaniburner.executeAll", "group": "1_all",    "when": "kaniburner.deviceConnected" },
+        { "command": "kaniburner.compile",    "group": "2_steps" },
+        { "command": "kaniburner.write",      "group": "2_steps",  "when": "kaniburner.deviceConnected" },
+        { "command": "kaniburner.execute",    "group": "2_steps",  "when": "kaniburner.deviceConnected" },
+        { "command": "kaniburner.run",        "group": "3_mruby" },
+        { "command": "kaniburner.connect",    "group": "4_serial", "when": "!kaniburner.deviceConnected" },
+        { "command": "kaniburner.break",      "group": "4_serial", "when": "kaniburner.deviceConnected" },
+        { "command": "kaniburner.disconnect", "group": "4_serial", "when": "kaniburner.deviceConnected" }
+      ]
+    }
+  },
+  "dependencies": {
+    "serialport": "^13.0.0"
+  }
+}
