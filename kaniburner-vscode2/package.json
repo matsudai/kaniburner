@@ -1,7 +1,7 @@
 {
   "name": "kaniburner",
   "displayName": "Kaniburner",
-  "version": "0.0.5",
+  "version": "0.0.7",
   "description": "mruby compiler and mrbwrite writer",
   "publisher": "matsudai",
   "repository": {
