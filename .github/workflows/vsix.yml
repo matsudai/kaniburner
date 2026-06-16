@@ -1,0 +1,43 @@
+name: Package and Release VSIX
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: vsix/package-lock.json
+
+      - name: Fetch default mruby WASM assets from GitHub Release
+        run: make -C vsix fetch-wasm
+
+      - name: Install npm dependencies
+        run: npm ci
+        working-directory: vsix
+
+      - name: Package .vsix
+        run: npx --yes @vscode/vsce package --allow-missing-repository
+        working-directory: vsix
+
+      - name: Upload .vsix to GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release view "$TAG" --repo "${{ github.repository }}" \
+            || gh release create "$TAG" --title "$TAG" --notes "Kaniburner $TAG" --repo "${{ github.repository }}"
+          gh release upload "$TAG" vsix/*.vsix --repo "${{ github.repository }}" --clobber

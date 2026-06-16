@@ -1,0 +1,57 @@
+name: WASM Build & Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Release tag to publish the mruby WASM assets under'
+        required: true
+        default: wasm-0.0.1
+  push:
+    tags:
+      - 'wasm-*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      - name: Init emsdk submodule
+        run: git submodule update --init components/emsdk
+
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.3'
+          bundler-cache: false
+
+      - name: Install emsdk and bundle dependencies
+        run: make -C vsix install
+
+      - name: Build all mruby versions and collect release assets
+        run: make -C vsix dist
+
+      - name: Resolve release tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag=${{ inputs.release_tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          gh release view "$TAG" --repo "${{ github.repository }}" \
+            || gh release create "$TAG" --title "$TAG" --notes "mruby WASM assets ($TAG)" --repo "${{ github.repository }}"
+          gh release upload "$TAG" vsix/dist/* --repo "${{ github.repository }}" --clobber
