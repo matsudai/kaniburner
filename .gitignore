@@ -1,2 +1,4 @@
 build_config/*.lock
 *.mrb
+/components/mruby/
+/components/mruby-*/

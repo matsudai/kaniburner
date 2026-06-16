@@ -1,0 +1,90 @@
+{
+  "name": "kaniburner",
+  "displayName": "Kaniburner",
+  "version": "0.0.10",
+  "description": "mruby compiler and mrbwrite writer",
+  "publisher": "matsudai",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/matsudai/kaniburner"
+  },
+  "main": "./src/extension.js",
+  "engines": {
+    "vscode": "^1.86.0"
+  },
+  "contributes": {
+    "commands": [
+      { "command": "kaniburner.executeAll",       "title": "Kaniburner: Execute All" },
+      { "command": "kaniburner.compile",           "title": "Kaniburner: Compile" },
+      { "command": "kaniburner.write",             "title": "Kaniburner: Write" },
+      { "command": "kaniburner.execute",           "title": "Kaniburner: Execute" },
+      { "command": "kaniburner.reset",             "title": "Kaniburner: Reset" },
+      { "command": "kaniburner.connect",           "title": "Kaniburner: Connect" },
+      { "command": "kaniburner.disconnect",        "title": "Kaniburner: Disconnect" },
+      { "command": "kaniburner.selectVersion",     "title": "Kaniburner: Select mruby Version" },
+      { "command": "kaniburner.selectBaud",        "title": "Kaniburner: Select Baud Rate" },
+      { "command": "kaniburner.selectPort",        "title": "Kaniburner: Select Serial Port" },
+      { "command": "kaniburner.addLibrary",          "title": "Kaniburner: Add Library", "icon": "$(add)" },
+      { "command": "kaniburner.addTask",             "title": "Kaniburner: Add Task", "icon": "$(add)" },
+      { "command": "kaniburner.moveProjectFileUp",   "title": "Kaniburner: Move Up", "icon": "$(arrow-up)" },
+      { "command": "kaniburner.moveProjectFileDown", "title": "Kaniburner: Move Down", "icon": "$(arrow-down)" },
+      { "command": "kaniburner.removeProjectFile",   "title": "Kaniburner: Remove", "icon": "$(remove)" }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        { "id": "kaniburner", "title": "Kaniburner", "icon": "media/kaniburner.svg" }
+      ]
+    },
+    "views": {
+      "kaniburner": [
+        { "id": "kaniburner.execute", "name": "Execute", "type": "webview" },
+        { "id": "kaniburner.project", "name": "Project" },
+        { "id": "kaniburner.device",  "name": "Device & Compiler" }
+      ]
+    },
+    "viewsWelcome": [
+      {
+        "view": "kaniburner.project",
+        "contents": "プロジェクトを使うにはフォルダを開いてください。\n[フォルダを開く](command:workbench.action.files.openFolder)",
+        "when": "workspaceFolderCount == 0"
+      }
+    ],
+    "menus": {
+      "view/item/context": [
+        {
+          "command": "kaniburner.addLibrary",
+          "when": "view == kaniburner.project && viewItem == librariesParent",
+          "group": "inline"
+        },
+        {
+          "command": "kaniburner.addTask",
+          "when": "view == kaniburner.project && viewItem == tasksParent",
+          "group": "inline"
+        },
+        {
+          "command": "kaniburner.moveProjectFileUp",
+          "when": "view == kaniburner.project && viewItem =~ /^projectFile(Mid|Last)$/",
+          "group": "inline@1"
+        },
+        {
+          "command": "kaniburner.moveProjectFileDown",
+          "when": "view == kaniburner.project && viewItem =~ /^projectFile(First|Mid)$/",
+          "group": "inline@2"
+        },
+        {
+          "command": "kaniburner.removeProjectFile",
+          "when": "view == kaniburner.project && viewItem =~ /^projectFile/",
+          "group": "inline@3"
+        }
+      ],
+      "commandPalette": [
+        { "command": "kaniburner.moveProjectFileUp", "when": "false" },
+        { "command": "kaniburner.moveProjectFileDown", "when": "false" },
+        { "command": "kaniburner.removeProjectFile", "when": "false" }
+      ]
+    }
+  },
+  "dependencies": {
+    "serialport": "^13.0.0"
+  }
+}

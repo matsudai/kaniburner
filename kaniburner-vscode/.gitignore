@@ -1,6 +1,0 @@
-node_modules
-*.vsix
-/media/mrbc
-/media/mrbc.wasm
-/media/mruby
-/media/mruby.wasm
