@@ -1,2 +1,8 @@
 build_config/*.lock
 *.mrb
+
+# make が取得・展開する mruby ソースと emsdk
+/components/
+
+/build/*
+!/build/.keep

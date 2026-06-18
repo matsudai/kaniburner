@@ -10,6 +10,10 @@ MAKEFILE_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 EMSDK_ENV    := . $(MAKEFILE_DIR)components/emsdk/emsdk_env.sh
 MRUBY_CONFIG := $(MAKEFILE_DIR)build_config/browser.rb
 MRUBY_DIR    := components/mruby
+EMSDK_DIR    := components/emsdk
+
+MRUBY_REF          := 3.4.0
+EMSCRIPTEN_VERSION := 5.0.2
 
 MRBC_BIN   := $(MRUBY_DIR)/build/emscripten-browser-mrbc/bin/mrbc
 MRBC_WASM  := $(MRUBY_DIR)/build/emscripten-browser-mrbc/bin/mrbc.wasm
@@ -22,15 +26,22 @@ DEST_DIRS := kaniburner-browser kaniburner-vscode/media
 
 .DEFAULT_GOAL := all
 
-# WASM ビルド
-all:
+$(MRUBY_DIR):
+	@mkdir -p $@
+	set -o pipefail; curl -fL https://github.com/mruby/mruby/archive/refs/tags/$(MRUBY_REF).tar.gz \
+	  | tar xz --strip-components=1 -C $@
+
+$(EMSDK_DIR):
+	@mkdir -p $@
+	set -o pipefail; curl -fL https://github.com/emscripten-core/emsdk/archive/refs/tags/$(EMSCRIPTEN_VERSION).tar.gz \
+	  | tar xz --strip-components=1 -C $@
+
+all: | $(MRUBY_DIR)
 	$(EMSDK_ENV) && cd $(MRUBY_DIR) && MRUBY_CONFIG=$(MRUBY_CONFIG) bundle exec rake
 
-# ビルド成果物の削除
 clean:
 	$(EMSDK_ENV) && cd $(MRUBY_DIR) && MRUBY_CONFIG=$(MRUBY_CONFIG) bundle exec rake clean
 
-# kaniburner-browser/ および kaniburner-vscode/media/ へコピー
 deploy: all
 	$(foreach dir,$(DEST_DIRS),\
 		cp $(MRBC_BIN)   $(dir)/mrbc && \
@@ -39,11 +50,22 @@ deploy: all
 		cp $(MRUBY_WASM) $(dir)/mruby.wasm && \
 	) true
 
-# emsdk のインストール・有効化
-install:
-	cd components/emsdk && ./emsdk install latest && ./emsdk activate latest
+install: | $(EMSDK_DIR)
+	cd $(EMSDK_DIR) && ./emsdk install $(EMSCRIPTEN_VERSION) && ./emsdk activate $(EMSCRIPTEN_VERSION)
 
-# 利用可能なコマンドの表示
+# Release に添付する mruby バイナリを作る。例: make mruby-4.0.0
+mruby-%: | $(EMSDK_DIR)
+	@mkdir -p components/mruby-$*
+	set -o pipefail; curl -fL https://github.com/mruby/mruby/archive/refs/tags/$*.tar.gz \
+	  | tar xz --strip-components=1 -C components/mruby-$*
+	$(EMSDK_ENV) && cd components/mruby-$* && bundle install && \
+	  MRUBY_CONFIG=$(MRUBY_CONFIG) bundle exec rake
+	@mkdir -p build/mruby-$*
+	cp components/mruby-$*/build/emscripten-browser-mrbc/bin/mrbc        build/mruby-$*/
+	cp components/mruby-$*/build/emscripten-browser-mrbc/bin/mrbc.wasm   build/mruby-$*/
+	cp components/mruby-$*/build/emscripten-browser-mruby/bin/mruby      build/mruby-$*/
+	cp components/mruby-$*/build/emscripten-browser-mruby/bin/mruby.wasm build/mruby-$*/
+
 help:
 	@echo "Usage: make [target]"
 	@echo ""

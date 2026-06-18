@@ -5,16 +5,12 @@
 Clone
 
 ```sh
-git clone \
-  --filter=blob:none --also-filter-submodules \
-  --recurse-submodules \
-  https://github.com/matsudai/kaniburner.git
-
-# git -c submodule.recurse=true -c clone.filter=blob:none \
-#   submodule update --init --recursive
+git clone https://github.com/matsudai/kaniburner.git
 ```
 
 Build
+
+`make install` で emsdk と mruby ソースを取得・展開し（`components/` 配下，git 管理外），`make` でビルドする．
 
 ```sh
 make install
