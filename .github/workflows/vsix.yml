@@ -23,34 +23,13 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Init emsdk submodule
-        run: git submodule update --init components/emsdk
-
-      - name: Set up Ruby
-        uses: ruby/setup-ruby@v1
-        with:
-          ruby-version: '3.3'
-
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-          cache: 'npm'
-          cache-dependency-path: vsix/package-lock.json
-
-      - name: Install emsdk
-        run: make -C vsix install
-
-      - name: Build mruby WASM
-        run: make -C vsix deploy
-
-      - name: Install npm dependencies
-        run: npm ci
-        working-directory: vsix
+      - name: Build the build image
+        run: docker build -t localhost/kaniburner --build-arg uid=$(id -u) --build-arg gid=$(id -g) .
 
       - name: Package .vsix
-        run: npx --yes @vscode/vsce package --allow-missing-repository
-        working-directory: vsix
+        run: |
+          docker run --rm -v "$PWD":/workspaces/kaniburner localhost/kaniburner \
+            bash -c "make -C vsix install && make -C vsix"
 
       - name: Upload .vsix to GitHub Release
         env:

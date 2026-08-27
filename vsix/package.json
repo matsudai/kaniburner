@@ -1,44 +1,132 @@
 {
   "name": "kaniburner",
-  "displayName": "kaniburner",
+  "displayName": "Kaniburner",
+  "version": "0.0.11",
   "description": "mruby compiler and mrbwrite writer",
-  "version": "0.0.1",
-  "engines": {
-    "vscode": "^1.134.0"
+  "publisher": "matsudai",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/matsudai/kaniburner"
   },
-  "categories": [
-    "Other"
-  ],
-  "activationEvents": [],
-  "main": "./out/extension.js",
+  "main": "./out/main.js",
+  "engines": {
+    "vscode": "^1.113.0"
+  },
   "contributes": {
     "commands": [
+      { "command": "kaniburner.executeAll",       "category": "Kaniburner", "title": "Execute All",          "icon": "$(run-all)",          "enablement": "kaniburner.canExecuteAll" },
+      { "command": "kaniburner.compile",           "category": "Kaniburner", "title": "Compile",              "icon": "$(build)",            "enablement": "kaniburner.canCompile" },
+      { "command": "kaniburner.write",             "category": "Kaniburner", "title": "Write",                "icon": "$(cloud-upload)",     "enablement": "kaniburner.canWrite" },
+      { "command": "kaniburner.execute",           "category": "Kaniburner", "title": "Execute",              "icon": "$(play)",             "enablement": "kaniburner.canExecute" },
+      { "command": "kaniburner.reset",             "category": "Kaniburner", "title": "Reset",                "icon": "$(debug-restart)",    "enablement": "kaniburner.canReset" },
+      { "command": "kaniburner.connect",           "category": "Kaniburner", "title": "Connect",              "icon": "$(plug)",             "enablement": "kaniburner.canConnect" },
+      { "command": "kaniburner.disconnect",        "category": "Kaniburner", "title": "Disconnect",           "icon": "$(debug-disconnect)", "enablement": "kaniburner.canDisconnect" },
+      { "command": "kaniburner.selectVersion",     "category": "Kaniburner", "title": "Select mruby Version", "icon": "$(edit)" },
+      { "command": "kaniburner.selectBaud",        "category": "Kaniburner", "title": "Select Baud Rate",     "icon": "$(edit)" },
+      { "command": "kaniburner.selectPort",        "category": "Kaniburner", "title": "Select Serial Port",   "icon": "$(edit)" },
+      { "command": "kaniburner.addLibrary",          "category": "Kaniburner", "title": "Add Library", "icon": "$(add)" },
+      { "command": "kaniburner.addTask",             "category": "Kaniburner", "title": "Add Task", "icon": "$(add)" },
+      { "command": "kaniburner.moveProjectFileUp",   "category": "Kaniburner", "title": "Move Up", "icon": "$(arrow-up)" },
+      { "command": "kaniburner.moveProjectFileDown", "category": "Kaniburner", "title": "Move Down", "icon": "$(arrow-down)" },
+      { "command": "kaniburner.removeProjectFile",   "category": "Kaniburner", "title": "Remove", "icon": "$(remove)" }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        { "id": "kaniburner", "title": "Kaniburner", "icon": "media/kaniburner.svg" }
+      ]
+    },
+    "views": {
+      "kaniburner": [
+        { "id": "kaniburner.project", "name": "Project" },
+        { "id": "kaniburner.device",  "name": "Device & Compiler" }
+      ]
+    },
+    "viewsWelcome": [
       {
-        "command": "kaniburner.helloWorld",
-        "title": "Hello World"
+        "view": "kaniburner.project",
+        "contents": "プロジェクトを使うにはフォルダを開いてください。\n[フォルダを開く](command:workbench.action.files.openFolder)",
+        "when": "workspaceFolderCount == 0"
       }
-    ]
+    ],
+    "menus": {
+      "view/title": [
+        { "command": "kaniburner.executeAll", "when": "view == kaniburner.project", "group": "navigation@1" },
+        { "command": "kaniburner.compile",    "when": "view == kaniburner.project", "group": "navigation@2" },
+        { "command": "kaniburner.write",      "when": "view == kaniburner.project", "group": "navigation@3" },
+        { "command": "kaniburner.execute",    "when": "view == kaniburner.project", "group": "navigation@4" },
+        { "command": "kaniburner.connect",    "when": "view == kaniburner.device && !kaniburner.connected", "group": "navigation@1" },
+        { "command": "kaniburner.disconnect", "when": "view == kaniburner.device && kaniburner.connected",  "group": "navigation@1" },
+        { "command": "kaniburner.reset",      "when": "view == kaniburner.device", "group": "navigation@2" }
+      ],
+      "view/item/context": [
+        {
+          "command": "kaniburner.addLibrary",
+          "when": "view == kaniburner.project && viewItem == librariesParent",
+          "group": "inline"
+        },
+        {
+          "command": "kaniburner.addTask",
+          "when": "view == kaniburner.project && viewItem == tasksParent",
+          "group": "inline"
+        },
+        {
+          "command": "kaniburner.moveProjectFileUp",
+          "when": "view == kaniburner.project && viewItem =~ /^projectFile(Mid|Last)$/",
+          "group": "inline@1"
+        },
+        {
+          "command": "kaniburner.moveProjectFileDown",
+          "when": "view == kaniburner.project && viewItem =~ /^projectFile(First|Mid)$/",
+          "group": "inline@2"
+        },
+        {
+          "command": "kaniburner.removeProjectFile",
+          "when": "view == kaniburner.project && viewItem =~ /^projectFile/",
+          "group": "inline@3"
+        },
+        {
+          "command": "kaniburner.selectPort",
+          "when": "view == kaniburner.device && viewItem == devicePort",
+          "group": "inline"
+        },
+        {
+          "command": "kaniburner.selectBaud",
+          "when": "view == kaniburner.device && viewItem == deviceBaud",
+          "group": "inline"
+        },
+        {
+          "command": "kaniburner.selectVersion",
+          "when": "view == kaniburner.device && viewItem == deviceVersion",
+          "group": "inline"
+        }
+      ],
+      "explorer/context": [
+        { "command": "kaniburner.addLibrary", "when": "resourceExtname == .rb || explorerResourceIsFolder", "group": "kaniburner@1" },
+        { "command": "kaniburner.addTask",    "when": "resourceExtname == .rb || explorerResourceIsFolder", "group": "kaniburner@2" }
+      ],
+      "editor/title/context": [
+        { "command": "kaniburner.addLibrary", "when": "resourceExtname == .rb", "group": "kaniburner@1" },
+        { "command": "kaniburner.addTask",    "when": "resourceExtname == .rb", "group": "kaniburner@2" }
+      ],
+      "commandPalette": [
+        { "command": "kaniburner.moveProjectFileUp", "when": "false" },
+        { "command": "kaniburner.moveProjectFileDown", "when": "false" },
+        { "command": "kaniburner.removeProjectFile", "when": "false" }
+      ]
+    }
   },
   "scripts": {
     "vscode:prepublish": "npm run compile",
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
-    "pretest": "npm run compile && npm run lint",
-    "lint": "eslint src",
-    "test": "vscode-test"
+    "test": "npm run compile && node --test test/*.test.js"
   },
   "devDependencies": {
-    "@types/vscode": "^1.134.0",
-    "@types/mocha": "^10.0.10",
     "@types/node": "24.x",
-    "typescript-eslint": "^8.61.1",
-    "eslint": "^10.5.0",
-    "typescript": "^6.0.3",
-    "@vscode/test-cli": "^0.0.15",
-    "@vscode/test-electron": "^3.0.0"
+    "@types/vscode": "^1.113.0",
+    "typescript": "^6.0.3"
   },
-  "overrides": {
-    "diff": "^8.0.4",
-    "serialize-javascript": "^7.0.6"
+  "dependencies": {
+    "serialport": "^13.0.0"
   }
 }

@@ -1,5 +1,7 @@
-out
-dist
-node_modules
-.vscode-test/
+node_modules/
+out/
 *.vsix
+.npm.stamp
+/media/mruby-*/
+/components/
+build_config/*.lock
