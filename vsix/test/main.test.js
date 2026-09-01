@@ -1,11 +1,167 @@
 const { describe, it, beforeEach, afterEach } = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
+const os = require('node:os');
 const path = require('node:path');
 const main = require('../out/main.js');
-const { createContext, contextValues, createSerialPort, EventEmitter, Uri, advance, flush, makeWorkspace, readProjectConfig, writeProjectConfig } = require('./helpers');
 
 const encode = (text) => new TextEncoder().encode(text);
+
+/**
+ * テスト用の偽の依存。
+ * vscodeは未定義メンバーの参照で失敗させ、テストが想定していないAPI利用を検知する。
+ */
+function strict(name, object) {
+  return new Proxy(object, {
+    get(target, key) {
+      if (key in target || typeof key === 'symbol' || key === 'then') return target[key];
+      throw new Error(`unexpected ${name}.${String(key)}`);
+    }
+  });
+}
+
+class Uri {
+  constructor(fsPath) { this.fsPath = fsPath; }
+  static file(fsPath) { return new Uri(fsPath); }
+}
+
+class TreeItem {
+  constructor(label, collapsibleState) { this.label = label; this.collapsibleState = collapsibleState; }
+}
+
+class ThemeIcon {
+  constructor(id, color) { this.id = id; this.color = color; }
+}
+
+class ThemeColor {
+  constructor(id) { this.id = id; }
+}
+
+class EventEmitter {
+  constructor() { this.fired = 0; this.event = () => {}; }
+  fire() { this.fired++; }
+}
+
+/** デバイスの応答。書き込まれたテキストに対する返信を返す。 */
+function mrbwriteDevice(text) {
+  if (text === '\r\n') return '+OK mruby/c\r\n';
+  if (text.startsWith('clear')) return '+OK\r\n';
+  if (text.startsWith('write')) return '+OK Write bytecode\r\n';
+  if (text.startsWith('execute')) return '+OK Execute\r\n';
+  if (text.startsWith('reset')) return '';
+  return '+DONE\r\n';
+}
+
+/**
+ * serialportのSerialPortの偽物を作る。
+ *
+ * @param ports list()が返すポート一覧。
+ * @param openError 接続時に返すエラー。
+ * @param device 書き込みに対して同期的に返信する関数。
+ */
+function createSerialPort({ ports = [], openError = null, device = mrbwriteDevice } = {}) {
+  return class SerialPort {
+    static instances = [];
+    static list() { return Promise.resolve(ports); }
+
+    constructor({ path: portPath, baudRate }, callback) {
+      this.path = portPath;
+      this.baudRate = baudRate;
+      this.listeners = {};
+      this.written = [];
+      this.sets = [];
+      this.closed = false;
+      SerialPort.instances.push(this);
+      queueMicrotask(() => callback(openError));
+    }
+
+    on(event, listener) { this.listeners[event] = listener; }
+
+    write(buffer, callback) {
+      this.written.push(buffer.toString('latin1'));
+      callback(null);
+      const reply = device(buffer.toString('latin1'));
+      if (reply) this.receive(reply);
+    }
+
+    set(options, callback) { this.sets.push(options); callback(); }
+
+    close(callback) {
+      this.closed = true;
+      callback();
+      this.listeners.close?.();
+    }
+
+    receive(text) { this.listeners.data(Buffer.from(text)); }
+  };
+}
+
+/**
+ * Contextを組み立てる。
+ *
+ * @param window vscode.windowに生やすメンバー。
+ * @param root ワークスペースルート。
+ */
+function createContext({ window = {}, root = null, device = {}, SerialPort = createSerialPort(), extensionPath = '/ext' } = {}) {
+  const output = {
+    lines: [],
+    text: '',
+    shown: 0,
+    append(text) { this.text += text; },
+    appendLine(line) { this.lines.push(line); },
+    show() { this.shown++; }
+  };
+  const storage = {
+    data: { 'kaniburner.device': device },
+    get(key) { return this.data[key]; },
+    update(key, value) { this.data[key] = value; return Promise.resolve(); }
+  };
+  const commands = {
+    calls: [],
+    executeCommand(...args) { this.calls.push(args); }
+  };
+  const vscode = strict('vscode', {
+    Uri, TreeItem, ThemeIcon, ThemeColor, EventEmitter,
+    TreeItemCollapsibleState: { Expanded: 1 },
+    TreeItemCheckboxState: { Unchecked: 0, Checked: 1 },
+    commands,
+    window: strict('vscode.window', window),
+    workspace: strict('vscode.workspace', { workspaceFolders: root ? [{ uri: new Uri(root) }] : undefined })
+  });
+  return main.buildContext({ vscode, SerialPort, storage, extensionPath, output });
+}
+
+/** setContextで設定された値をまとめる。 */
+function contextValues(context) {
+  const values = {};
+  for (const [command, key, value] of context.vscode.commands.calls) {
+    if (command === 'setContext') values[key] = value;
+  }
+  return values;
+}
+
+function makeWorkspace() {
+  return fs.mkdtempSync(path.join(os.tmpdir(), 'kaniburner-'));
+}
+
+function readProjectConfig(root) {
+  return JSON.parse(fs.readFileSync(path.join(root, '.vscode/kaniburner.json'), 'utf8'));
+}
+
+function writeProjectConfig(root, config) {
+  fs.mkdirSync(path.join(root, '.vscode'), { recursive: true });
+  fs.writeFileSync(path.join(root, '.vscode/kaniburner.json'), JSON.stringify(config));
+}
+
+/** 保留中のマイクロタスクとI/Oコールバックを流す。 */
+const flush = () => new Promise((resolve) => setImmediate(resolve));
+
+/** 偽のタイマーを進める。前後でPromiseの解決を進める。 */
+async function advance(t, milliseconds) {
+  await flush();
+  t.mock.timers.tick(milliseconds);
+  await flush();
+}
 
 describe('#mrbwriteCrc16', () => {
   it('空データでは0xffffになること', () => {
@@ -480,7 +636,7 @@ describe('#getSettings', () => {
   it('欠落キーを既定値で補うこと', () => {
     const context = createContext({ root });
     assert.deepEqual(main.getSettings(context), {
-      version: '4.0.0', port: null, baud: 115200, libraries: [], tasks: []
+      version: '4.0.0', port: null, baud: 115200, autoConnect: true, libraries: [], tasks: []
     });
   });
 
@@ -488,7 +644,7 @@ describe('#getSettings', () => {
     writeProjectConfig(root, { compiler: { version: '3.4.0' }, libraries: [{ filename: 'lib.rb' }], tasks: [{ filename: 'main.rb' }] });
     const context = createContext({ root, device: { port: '/dev/x', baud: 9600 } });
     assert.deepEqual(main.getSettings(context), {
-      version: '3.4.0', port: '/dev/x', baud: 9600, libraries: [{ filename: 'lib.rb' }], tasks: [{ filename: 'main.rb' }]
+      version: '3.4.0', port: '/dev/x', baud: 9600, autoConnect: true, libraries: [{ filename: 'lib.rb' }], tasks: [{ filename: 'main.rb' }]
     });
   });
 
@@ -960,6 +1116,81 @@ describe('#ensureReady', () => {
   });
 });
 
+describe('#autoConnectEnabled', () => {
+  it('既定では有効になること', () => {
+    assert.equal(main.autoConnectEnabled(createContext({ device: { port: '/dev/x' } })), true);
+  });
+
+  it('ポートが未設定なら無効になること', () => {
+    assert.equal(main.autoConnectEnabled(createContext({ device: { autoConnect: true } })), false);
+  });
+
+  it('明示的に無効にできること', () => {
+    assert.equal(main.autoConnectEnabled(createContext({ device: { port: '/dev/x', autoConnect: false } })), false);
+  });
+});
+
+describe('#pollAutoConnect', () => {
+  const createPollContext = (device, ports = [{ path: '/dev/x' }]) =>
+    createContext({ device, SerialPort: createSerialPort({ ports }) });
+
+  it('設定のポートが現れたら接続してコマンドモードへ入ること', async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    const context = createPollContext({ port: '/dev/x', baud: 9600 });
+    const result = main.pollAutoConnect(context);
+    await advance(t, 1000);
+    await result;
+    assert.equal(context.serialPort.path, '/dev/x');
+    assert.equal(context.serialPort.baudRate, 9600);
+    assert.ok(context.output.lines.includes('[info]  Auto-connected.'));
+    assert.equal(context.commandMode, true);
+  });
+
+  it('前回も見えていたポートには接続しないこと', async () => {
+    const context = createPollContext({ port: '/dev/x' });
+    context.portPresent = true;
+    await main.pollAutoConnect(context);
+    assert.equal(context.SerialPort.instances.length, 0);
+  });
+
+  it('ポートが消えたら次に現れた時へ備えること', async () => {
+    const context = createPollContext({ port: '/dev/x' }, []);
+    context.portPresent = true;
+    await main.pollAutoConnect(context);
+    assert.equal(context.portPresent, false);
+  });
+
+  it('接続中は何もしないこと', async () => {
+    const context = createPollContext({ port: '/dev/x' });
+    await main.connect(context, '/dev/x', 9600);
+    await main.pollAutoConnect(context);
+    assert.equal(context.SerialPort.instances.length, 1);
+  });
+
+  it('操作の実行中は何もしないこと', async () => {
+    const context = createPollContext({ port: '/dev/x' });
+    context.running = 1;
+    await main.pollAutoConnect(context);
+    assert.equal(context.SerialPort.instances.length, 0);
+  });
+
+  it('無効なら何もしないこと', async () => {
+    const context = createPollContext({ port: '/dev/x', autoConnect: false });
+    await main.pollAutoConnect(context);
+    assert.equal(context.SerialPort.instances.length, 0);
+  });
+
+  it('接続に失敗してもエラーとして記録しないこと', async () => {
+    const context = createContext({
+      device: { port: '/dev/x' },
+      SerialPort: createSerialPort({ ports: [{ path: '/dev/x' }], openError: new Error('busy') })
+    });
+    await main.pollAutoConnect(context);
+    assert.equal(context.serialPort, null);
+    assert.ok(!context.output.lines.some((line) => line.startsWith('[error]')));
+  });
+});
+
 describe('#createProvider', () => {
   it('refreshで変更イベントを発火すること', () => {
     const emitter = new EventEmitter();
@@ -986,11 +1217,12 @@ describe('#buildDeviceView', () => {
   beforeEach(() => { root = makeWorkspace(); });
   afterEach(() => fs.rmSync(root, { recursive: true }));
 
-  it('ポート・ボーレート・バージョンの行を返すこと', () => {
+  it('ポート・ボーレート・自動接続・バージョンの行を返すこと', () => {
     const context = createContext({ root, device: { port: '/dev/x', baud: 9600 } });
     assert.deepEqual(main.buildDeviceView(context).map((item) => [item.label, item.description, item.contextValue]), [
       ['Port', '/dev/x', 'devicePort'],
       ['Baud', '9600', 'deviceBaud'],
+      ['Auto connect', undefined, 'deviceAutoConnect'],
       ['mruby', '4.0.0', 'deviceVersion']
     ]);
   });
@@ -1001,10 +1233,17 @@ describe('#buildDeviceView', () => {
 
   it('コンパイラが無いバージョンには警告を付けること', () => {
     writeProjectConfig(root, { compiler: { version: '9.9.9' } });
-    const version = main.buildDeviceView(createContext({ root }))[2];
+    const version = main.buildDeviceView(createContext({ root }))[3];
     assert.equal(version.description, '9.9.9 (not found)');
     assert.equal(version.iconPath.id, 'warning');
     assert.equal(version.iconPath.color.id, 'errorForeground');
+  });
+
+  it('自動接続の実効値をチェックボックスに出すこと', () => {
+    const checkbox = (device) => main.buildDeviceView(createContext({ root, device }))[2].checkboxState;
+    assert.equal(checkbox({ port: '/dev/x' }), 1);
+    assert.equal(checkbox({ port: '/dev/x', autoConnect: false }), 0);
+    assert.equal(checkbox({ autoConnect: true }), 0);
   });
 
   it('子要素は持たないこと', () => {
@@ -1067,9 +1306,10 @@ describe('#refreshButtons', () => {
     const context = createContext({ root });
     main.refreshButtons(context);
     assert.deepEqual(contextValues(context), {
-      'kaniburner.connected': false,
+      'kaniburner.connected': false, 'kaniburner.runMode': false,
       'kaniburner.canExecuteAll': false, 'kaniburner.canCompile': true, 'kaniburner.canConnect': true,
-      'kaniburner.canDisconnect': false, 'kaniburner.canWrite': false, 'kaniburner.canExecute': false, 'kaniburner.canReset': false
+      'kaniburner.canDisconnect': false, 'kaniburner.canWrite': false, 'kaniburner.canExecute': false,
+      'kaniburner.canReset': false, 'kaniburner.canBreak': false
     });
   });
 
@@ -1082,6 +1322,16 @@ describe('#refreshButtons', () => {
     assert.equal(values['kaniburner.canReset'], true);
     assert.equal(values['kaniburner.canWrite'], false);
     assert.equal(values['kaniburner.canExecute'], false);
+  });
+
+  it('実行モード中だけrunModeを立てること', async () => {
+    const context = createContext({ root });
+    await main.connect(context, '/dev/x', 9600);
+    main.refreshButtons(context);
+    assert.equal(contextValues(context)['kaniburner.runMode'], true);
+    context.commandMode = true;
+    main.refreshButtons(context);
+    assert.equal(contextValues(context)['kaniburner.runMode'], false);
   });
 
   it('コマンドモードではWriteとExecuteを押せること', async () => {

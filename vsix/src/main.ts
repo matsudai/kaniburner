@@ -12,6 +12,8 @@ const AVAILABLE_VERSIONS = ['3.4.0', '4.0.0'];
 const DEFAULT_VERSION = '4.0.0';
 const DEFAULT_BAUD = 115200;
 const PROJECT_CONFIG_FILENAME = '.vscode/kaniburner.json';
+/** 自動接続のためにポート一覧を見る間隔。 */
+const AUTO_CONNECT_INTERVAL = 1000;
 
 type ProjectKey = 'libraries' | 'tasks';
 
@@ -24,6 +26,7 @@ interface Entry {
 interface DeviceConfig {
   port?: string;
   baud?: number;
+  autoConnect?: boolean;
 }
 
 /** プロジェクト設定ファイルに保存する設定。 */
@@ -37,6 +40,7 @@ interface Settings {
   version: string;
   port: string | null;
   baud: number;
+  autoConnect: boolean;
   libraries: Entry[];
   tasks: Entry[];
 }
@@ -88,6 +92,8 @@ export interface Context extends Dependencies {
   responseResolve: ((line: string | null) => void) | null;
   /* シリアル通信 */
   serialPort: SerialPort | null;
+  /** 前回の監視で設定のポートが見えていたか。挿された瞬間だけ自動接続するために持つ。 */
+  portPresent: boolean;
   /* mrbcコンパイラ */
   mrbc: MrbcModule | null;
   mrbcDirectory: string | null;
@@ -111,6 +117,7 @@ export function buildContext(dependencies: Dependencies): Context {
     lastCommand: null,
     responseResolve: null,
     serialPort: null,
+    portPresent: false,
     mrbc: null,
     mrbcDirectory: null,
     running: 0
@@ -431,6 +438,7 @@ export function getSettings(context: Context): Settings {
     version: project.compiler?.version ?? DEFAULT_VERSION,
     port: device.port ?? null,
     baud: device.baud ?? DEFAULT_BAUD,
+    autoConnect: device.autoConnect ?? true,
     libraries: project.libraries ?? [],
     tasks: project.tasks ?? []
   };
@@ -763,6 +771,39 @@ export async function ensureReady(context: Context): Promise<boolean> {
   return await resetAndReconnect(context);
 }
 
+/** 自動接続の設定。ポートが未設定なら接続先が定まらないため自動接続はしない。 */
+export function autoConnectEnabled(context: Context): boolean {
+  const { port, autoConnect } = getSettings(context);
+  return port !== null && autoConnect;
+}
+
+/**
+ * 設定のポートを監視し、現れた瞬間に接続する。
+ *
+ * serialportに挿抜の通知は無いため、一覧を定期取得して前回との差を見る。
+ * 前回も見えていたポートには接続しないため、手動で切断した後は挿し直すまで繋ぎ直さない。
+ */
+export async function pollAutoConnect(context: Context) {
+  if (context.running > 0 || connected(context) || !autoConnectEnabled(context)) return;
+  const { port, baud } = getSettings(context);
+  let present;
+  try {
+    present = (await context.SerialPort.list()).some((portInfo) => portInfo.path === port);
+  } catch {
+    return;
+  }
+  const appeared = present && !context.portPresent;
+  context.portPresent = present;
+  if (!appeared) return;
+  logInfo(context, `Connecting (${baud} baud, ${port})...`);
+  try {
+    await connect(context, port as string, baud);
+    logInfo(context, 'Auto-connected.');
+    refreshAll(context);
+    await ensureCommandMode(context, 3);
+  } catch { /* 挿された直後は開けないことがある。次に挿し直された時へ委ねる。 */ }
+}
+
 /* --- ビュー --- */
 
 export function createProvider(api: typeof vscode, build: (element?: Item) => Item[]): Provider {
@@ -795,8 +836,20 @@ export function buildDeviceView(context: Context, element?: Item): Item[] {
   return [
     settingItem(context, 'Port', settings.port ?? '(none)', 'devicePort', 'plug'),
     settingItem(context, 'Baud', String(settings.baud), 'deviceBaud', 'pulse'),
+    autoConnectItem(context, settings),
     version
   ];
+}
+
+/** 自動接続の設定行。実効値をチェックボックスに出す。 */
+export function autoConnectItem(context: Context, settings: Settings): Item {
+  const item: Item = new context.vscode.TreeItem('Auto connect');
+  item.contextValue = 'deviceAutoConnect';
+  item.iconPath = new context.vscode.ThemeIcon('sync');
+  item.checkboxState = settings.port !== null && settings.autoConnect
+    ? context.vscode.TreeItemCheckboxState.Checked
+    : context.vscode.TreeItemCheckboxState.Unchecked;
+  return item;
 }
 
 export function projectParent(context: Context, label: string, key: ProjectKey, count: number): Item {
@@ -852,7 +905,7 @@ export function buildProjectView(context: Context, element?: Item): Item[] {
 /**
  * ツールバーのボタンの可否と、ConnectとDisconnectの出し分けに使う接続状態を更新する。
  *
- * デバイスは未接続 / コマンドモード / 実行モードの3状態を取り、実行モードから戻す手段はResetのみ。
+ * デバイスは未接続 / コマンドモード / 実行モードの3状態を取り、実行モードから戻す手段はBreakのみ。
  * Execute Allは内部で復帰まで行うため接続中は常に押せる。
  * Disconnectは待機中の脱出口のためrunningでは無効化しない。
  */
@@ -865,6 +918,7 @@ export function refreshButtons(context: Context) {
     context.vscode.commands.executeCommand('setContext', `kaniburner.${key}`, value);
   const setEnabled = (name: string, enabled: boolean) => setContext(`can${name}`, enabled);
   setContext('connected', isConnected);
+  setContext('runMode', isConnected && !context.commandMode);
   setEnabled('ExecuteAll', idle && isConnected && compilerReady);
   setEnabled('Compile', idle && compilerReady);
   setEnabled('Connect', idle && !isConnected);
@@ -872,6 +926,7 @@ export function refreshButtons(context: Context) {
   setEnabled('Write', idle && ready && compilerReady);
   setEnabled('Execute', idle && ready);
   setEnabled('Reset', idle && isConnected);
+  setEnabled('Break', idle && isConnected);
 }
 
 export function refreshAll(context: Context) {
@@ -971,11 +1026,22 @@ export function activate(extensionContext: vscode.ExtensionContext) {
   rememberEditor(context, api.window.activeTextEditor);
   extensionContext.subscriptions.push(api.window.onDidChangeActiveTextEditor((editor) => rememberEditor(context, editor)));
 
+  const deviceView = api.window.createTreeView<Item>('kaniburner.device', { treeDataProvider: context.deviceProvider });
   extensionContext.subscriptions.push(
     api.window.registerTreeDataProvider('kaniburner.project', context.projectProvider),
-    api.window.registerTreeDataProvider('kaniburner.device', context.deviceProvider)
+    deviceView,
+    deviceView.onDidChangeCheckboxState(({ items }) => {
+      for (const [item, state] of items) {
+        if (item.contextValue === 'deviceAutoConnect') {
+          updateDevice(context, { autoConnect: state === api.TreeItemCheckboxState.Checked });
+        }
+      }
+    })
   );
   refreshButtons(context);
+
+  const timer = setInterval(() => pollAutoConnect(context), AUTO_CONNECT_INTERVAL);
+  extensionContext.subscriptions.push({ dispose: () => clearInterval(timer) });
 
   // 手で編集された場合もビューへ反映する。
   const refresh = () => refreshAll(context);
@@ -1029,13 +1095,16 @@ export function activate(extensionContext: vscode.ExtensionContext) {
     }
   }));
 
-  register('kaniburner.reset', () => runAction(context, async () => {
+  // ResetとBreakはツールバーの同じ枠をモードで出し分ける。押した時の動作はresetAndReconnectが分ける。
+  const resetOrBreak = () => runAction(context, async () => {
     if (!connected(context)) {
       context.vscode.window.showWarningMessage('Kaniburner: Not connected.');
       return;
     }
     await resetAndReconnect(context);
-  }));
+  });
+  register('kaniburner.reset', resetOrBreak);
+  register('kaniburner.break', resetOrBreak);
 
   register('kaniburner.connect', () => runAction(context, async () => {
     if (connected(context)) {
