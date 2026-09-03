@@ -884,12 +884,12 @@ export function buildDeviceView(context: Context, element?: Item): Item[] {
   ];
 }
 
-/** 自動接続の設定行。実効値をチェックボックスに出す。 */
+/** 自動接続の設定行。 */
 export function autoConnectItem(context: Context, settings: Settings): Item {
   const item: Item = new context.vscode.TreeItem('Auto connect');
   item.contextValue = 'deviceAutoConnect';
   item.iconPath = new context.vscode.ThemeIcon('sync');
-  item.checkboxState = settings.port !== null && settings.autoConnect
+  item.checkboxState = settings.autoConnect
     ? context.vscode.TreeItemCheckboxState.Checked
     : context.vscode.TreeItemCheckboxState.Unchecked;
   return item;
@@ -962,7 +962,6 @@ export function refreshButtons(context: Context) {
     context.vscode.commands.executeCommand('setContext', `kaniburner.${key}`, value);
   const setEnabled = (name: string, enabled: boolean) => setContext(`can${name}`, enabled);
   setContext('connected', isConnected);
-  setContext('runMode', isConnected && !commandMode);
   setEnabled('ExecuteAll', idle && isConnected && compilerReady);
   setEnabled('Compile', idle && compilerReady);
   setEnabled('Connect', idle && !isConnected);
@@ -970,7 +969,6 @@ export function refreshButtons(context: Context) {
   setEnabled('Write', idle && ready && compilerReady);
   setEnabled('Execute', idle && ready);
   setEnabled('Reset', idle && isConnected);
-  setEnabled('Break', idle && isConnected);
 }
 
 export function refreshAll(context: Context) {
@@ -1140,7 +1138,7 @@ export function activate(extensionContext: vscode.ExtensionContext) {
     }
   }));
 
-  // ResetとBreakはツールバーの同じ枠をモードで出し分ける。押した時の動作はresetAndReconnectが分ける。
+  // ResetとBreakは1枠にまとめる。押した時の動作はresetAndReconnectが分ける。
   const resetOrBreak = () => runAction(context, async () => {
     if (!connected(context)) {
       context.vscode.window.showWarningMessage('Kaniburner: Not connected.');
@@ -1149,7 +1147,6 @@ export function activate(extensionContext: vscode.ExtensionContext) {
     await resetAndReconnect(context);
   });
   register('kaniburner.reset', resetOrBreak);
-  register('kaniburner.break', resetOrBreak);
 
   register('kaniburner.connect', () => runAction(context, async () => {
     if (connected(context)) {

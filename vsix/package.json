@@ -18,8 +18,7 @@
       { "command": "kaniburner.compile",           "category": "Kaniburner", "title": "Compile",              "icon": "$(build)",            "enablement": "kaniburner.canCompile" },
       { "command": "kaniburner.write",             "category": "Kaniburner", "title": "Write",                "icon": "$(cloud-upload)",     "enablement": "kaniburner.canWrite" },
       { "command": "kaniburner.execute",           "category": "Kaniburner", "title": "Execute",              "icon": "$(play)",             "enablement": "kaniburner.canExecute" },
-      { "command": "kaniburner.reset",             "category": "Kaniburner", "title": "Reset",                "icon": "$(debug-restart)",    "enablement": "kaniburner.canReset" },
-      { "command": "kaniburner.break",             "category": "Kaniburner", "title": "Break",                "icon": "$(debug-pause)",      "enablement": "kaniburner.canBreak" },
+      { "command": "kaniburner.reset",             "category": "Kaniburner", "title": "Reset / Break",        "icon": "$(debug-restart)",    "enablement": "kaniburner.canReset" },
       { "command": "kaniburner.connect",           "category": "Kaniburner", "title": "Connect",              "icon": "$(plug)",             "enablement": "kaniburner.canConnect" },
       { "command": "kaniburner.disconnect",        "category": "Kaniburner", "title": "Disconnect",           "icon": "$(debug-disconnect)", "enablement": "kaniburner.canDisconnect" },
       { "command": "kaniburner.selectVersion",     "category": "Kaniburner", "title": "Select mruby Version", "icon": "$(edit)" },
@@ -51,8 +50,7 @@
     ],
     "menus": {
       "view/title": [
-        { "command": "kaniburner.break",      "when": "view == kaniburner.project && kaniburner.runMode",  "group": "navigation@1" },
-        { "command": "kaniburner.reset",      "when": "view == kaniburner.project && !kaniburner.runMode", "group": "navigation@1" },
+        { "command": "kaniburner.reset",      "when": "view == kaniburner.project", "group": "navigation@1" },
         { "command": "kaniburner.executeAll", "when": "view == kaniburner.project", "group": "navigation@2" },
         { "command": "kaniburner.compile",    "when": "view == kaniburner.project", "group": "navigation@3" },
         { "command": "kaniburner.write",      "when": "view == kaniburner.project", "group": "navigation@4" },

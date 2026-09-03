@@ -1236,11 +1236,11 @@ describe('#buildDeviceView', () => {
     assert.equal(version.iconPath.color.id, 'errorForeground');
   });
 
-  it('自動接続の実効値をチェックボックスに出すこと', () => {
+  it('自動接続の保存値をチェックボックスに出すこと', () => {
     const checkbox = (device) => main.buildDeviceView(createContext({ root, device }))[2].checkboxState;
     assert.equal(checkbox({ port: '/dev/x' }), 1);
     assert.equal(checkbox({ port: '/dev/x', autoConnect: false }), 0);
-    assert.equal(checkbox({ autoConnect: true }), 0);
+    assert.equal(checkbox({ autoConnect: true }), 1);
   });
 
   it('子要素は持たないこと', () => {
@@ -1303,10 +1303,10 @@ describe('#refreshButtons', () => {
     const context = createContext({ root });
     main.refreshButtons(context);
     assert.deepEqual(contextValues(context), {
-      'kaniburner.connected': false, 'kaniburner.runMode': false,
+      'kaniburner.connected': false,
       'kaniburner.canExecuteAll': false, 'kaniburner.canCompile': true, 'kaniburner.canConnect': true,
       'kaniburner.canDisconnect': false, 'kaniburner.canWrite': false, 'kaniburner.canExecute': false,
-      'kaniburner.canReset': false, 'kaniburner.canBreak': false
+      'kaniburner.canReset': false
     });
   });
 
@@ -1319,16 +1319,6 @@ describe('#refreshButtons', () => {
     assert.equal(values['kaniburner.canReset'], true);
     assert.equal(values['kaniburner.canWrite'], false);
     assert.equal(values['kaniburner.canExecute'], false);
-  });
-
-  it('実行モード中だけrunModeを立てること', async () => {
-    const context = createContext({ root });
-    await main.connect(context, '/dev/x', 9600);
-    main.refreshButtons(context);
-    assert.equal(contextValues(context)['kaniburner.runMode'], true);
-    context.enterCommandMode();
-    main.refreshButtons(context);
-    assert.equal(contextValues(context)['kaniburner.runMode'], false);
   });
 
   it('コマンドモードではWriteとExecuteを押せること', async () => {
