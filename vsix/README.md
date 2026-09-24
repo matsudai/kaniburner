@@ -13,4 +13,5 @@ Firmware supports [mrbwrite protocol](https://github.com/mrubyc/mrbwrite).
 1. Open `.rb` file on VSCode.
 2. Run `> Kaniburner: Connect`.
 3. Select the device.
-4. Run `> Kaniburner: Execute All`.
+4. Run `> Kaniburner: Compile & Write`.
+5. Run `> Kaniburner: Execute`.

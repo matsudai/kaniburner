@@ -1,7 +1,7 @@
 {
   "name": "kaniburner",
   "displayName": "Kaniburner",
-  "version": "0.0.11",
+  "version": "0.0.12",
   "description": "mruby compiler and mrbwrite writer",
   "publisher": "matsudai",
   "repository": {
@@ -14,9 +14,8 @@
   },
   "contributes": {
     "commands": [
-      { "command": "kaniburner.executeAll",       "category": "Kaniburner", "title": "Execute All",          "icon": "$(run-all)",          "enablement": "kaniburner.canExecuteAll" },
       { "command": "kaniburner.compile",           "category": "Kaniburner", "title": "Compile",              "icon": "$(build)",            "enablement": "kaniburner.canCompile" },
-      { "command": "kaniburner.write",             "category": "Kaniburner", "title": "Write",                "icon": "$(cloud-upload)",     "enablement": "kaniburner.canWrite" },
+      { "command": "kaniburner.write",             "category": "Kaniburner", "title": "Compile & Write",      "icon": "$(cloud-upload)",     "enablement": "kaniburner.canWrite" },
       { "command": "kaniburner.execute",           "category": "Kaniburner", "title": "Execute",              "icon": "$(play)",             "enablement": "kaniburner.canExecute" },
       { "command": "kaniburner.reset",             "category": "Kaniburner", "title": "Reset / Break",        "icon": "$(debug-restart)",    "enablement": "kaniburner.canReset" },
       { "command": "kaniburner.connect",           "category": "Kaniburner", "title": "Connect",              "icon": "$(plug)",             "enablement": "kaniburner.canConnect" },
@@ -50,11 +49,10 @@
     ],
     "menus": {
       "view/title": [
-        { "command": "kaniburner.reset",      "when": "view == kaniburner.project", "group": "navigation@1" },
-        { "command": "kaniburner.executeAll", "when": "view == kaniburner.project", "group": "navigation@2" },
-        { "command": "kaniburner.compile",    "when": "view == kaniburner.project", "group": "navigation@3" },
-        { "command": "kaniburner.write",      "when": "view == kaniburner.project", "group": "navigation@4" },
-        { "command": "kaniburner.execute",    "when": "view == kaniburner.project", "group": "navigation@5" },
+        { "command": "kaniburner.compile",    "when": "view == kaniburner.project && !kaniburner.connected", "group": "navigation@1" },
+        { "command": "kaniburner.write",      "when": "view == kaniburner.project && kaniburner.connected", "group": "navigation@1" },
+        { "command": "kaniburner.execute",    "when": "view == kaniburner.project", "group": "navigation@2" },
+        { "command": "kaniburner.reset",      "when": "view == kaniburner.project", "group": "navigation@3" },
         { "command": "kaniburner.connect",    "when": "view == kaniburner.device && !kaniburner.connected", "group": "navigation@1" },
         { "command": "kaniburner.disconnect", "when": "view == kaniburner.device && kaniburner.connected",  "group": "navigation@1" }
       ],
@@ -109,6 +107,8 @@
         { "command": "kaniburner.addTask",    "when": "resourceExtname == .rb", "group": "kaniburner@2" }
       ],
       "commandPalette": [
+        { "command": "kaniburner.compile", "when": "!kaniburner.connected" },
+        { "command": "kaniburner.write", "when": "kaniburner.connected" },
         { "command": "kaniburner.moveProjectFileUp", "when": "false" },
         { "command": "kaniburner.moveProjectFileDown", "when": "false" },
         { "command": "kaniburner.removeProjectFile", "when": "false" }

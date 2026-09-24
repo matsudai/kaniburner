@@ -45,6 +45,7 @@ class EventEmitter {
 /** デバイスの応答。書き込まれたテキストに対する返信を返す。 */
 function mrbwriteDevice(text) {
   if (text === '\r\n') return '+OK mruby/c\r\n';
+  if (text === 'version\r\n') return '+OK mruby/c v3.3 RITE0300 MRBW1.2\r\n';
   if (text.startsWith('clear')) return '+OK\r\n';
   if (text.startsWith('write')) return '+OK Write bytecode\r\n';
   if (text.startsWith('execute')) return '+OK Execute\r\n';
@@ -353,6 +354,141 @@ describe('#ensureCommandMode', () => {
   });
 });
 
+describe('#parseBoardInfo', () => {
+  it('VMのバージョンとRITE形式を読み取ること', () => {
+    assert.deepEqual(main.parseBoardInfo('+OK mruby/c v3.3 RITE0300 MRBW1.2'), {
+      mrubyc: 'v3.3', rite: 'RITE0300', error: null
+    });
+  });
+
+  it('通信プロトコルのバージョンに依存しないこと', () => {
+    for (const suffix of ['', ' MRBW1.2', ' MRBW1.3']) {
+      assert.deepEqual(main.parseBoardInfo(`+OK mruby/c v4.0 RITE0400${suffix}`), {
+        mrubyc: 'v4.0', rite: 'RITE0400', error: null
+      });
+    }
+  });
+
+  it('RITE形式が無くてもVMのバージョンを読み取ること', () => {
+    assert.deepEqual(main.parseBoardInfo('+OK mruby/c v3.3'), { mrubyc: 'v3.3', rite: null, error: null });
+  });
+
+  it('起動メッセージからバージョンを補完しないこと', () => {
+    assert.deepEqual(main.parseBoardInfo('+OK mruby/c'), { mrubyc: null, rite: null, error: null });
+  });
+
+  it('不明な応答では原因を返すこと', () => {
+    for (const response of [null, '-ERR Illegal command.', '+DONE']) {
+      const info = main.parseBoardInfo(response);
+      assert.equal(info.mrubyc, null);
+      assert.equal(info.rite, null);
+      assert.ok(info.error);
+    }
+  });
+});
+
+describe('#readBoardInfo', () => {
+  it('自動判定がOFFでも取得し、同じ接続では再利用すること', async () => {
+    const context = createContext({ device: { autoDetect: false } });
+    await main.connect(context, '/dev/x', 9600);
+    context.enterCommandMode();
+    await main.readBoardInfo(context);
+    await main.readBoardInfo(context);
+    assert.deepEqual(context.get().boardInfo, { mrubyc: 'v3.3', rite: 'RITE0300', error: null });
+    assert.deepEqual(context.get().serialPort.written, ['version\r\n']);
+    assert.equal(main.resolveCompilerVersion(context).version, '4.0.0');
+  });
+
+  it('取得中の要求を共有し、分割された応答を待つこと', async () => {
+    const context = createContext({ SerialPort: createSerialPort({ device: () => '' }) });
+    await main.connect(context, '/dev/x', 9600);
+    context.enterCommandMode();
+    context.setPending('+OK mruby/c');
+    const first = main.readBoardInfo(context);
+    const second = main.readBoardInfo(context);
+    await flush();
+    const port = context.get().serialPort;
+    assert.deepEqual(port.written, ['version\r\n']);
+    port.receive('+OK mruby/c v3.3 RITE');
+    assert.equal(context.get().boardInfo, null);
+    port.receive('0300 MRBW1.2\r\n');
+    await Promise.all([first, second]);
+    assert.equal(context.get().boardInfo.rite, 'RITE0300');
+    assert.equal(context.get().boardInfoRequest, null);
+  });
+
+  it('応答が無くてもコマンドモードの準備は成功すること', async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    const context = createContext({ SerialPort: createSerialPort({ device: () => '' }) });
+    await main.connect(context, '/dev/x', 9600);
+    context.enterCommandMode();
+    const result = main.prepareDevice(context);
+    await advance(t, 5000);
+    assert.equal(await result, true);
+    assert.match(context.get().boardInfo.error, /応答がありません/);
+    assert.equal(context.get().responseResolve, null);
+  });
+
+  it('送信失敗の原因を保持し、応答待ちを終了すること', async () => {
+    const context = createContext();
+    await main.connect(context, '/dev/x', 9600);
+    context.enterCommandMode();
+    context.get().serialPort.write = (_, callback) => callback(new Error('busy'));
+    await main.readBoardInfo(context);
+    assert.match(context.get().boardInfo.error, /busy/);
+    assert.equal(context.get().responseResolve, null);
+    assert.equal(context.get().boardInfoRequest, null);
+  });
+
+  it('切断で取得結果を破棄し、次の接続では取り直すこと', async () => {
+    let response = '+OK mruby/c v3.3 RITE0300 MRBW1.2\r\n';
+    const context = createContext({ SerialPort: createSerialPort({ device: () => response }) });
+    await main.connect(context, '/dev/x', 9600);
+    context.enterCommandMode();
+    await main.readBoardInfo(context);
+    await main.disconnect(context);
+    assert.equal(context.get().boardInfo, null);
+    response = '+OK mruby/c v4.0 RITE0400 MRBW1.2\r\n';
+    await main.connect(context, '/dev/y', 9600);
+    context.enterCommandMode();
+    await main.readBoardInfo(context);
+    assert.equal(context.get().boardInfo.mrubyc, 'v4.0');
+    assert.deepEqual(context.get().serialPort.written, ['version\r\n']);
+  });
+
+  it('取得中にリセットされた応答を新しい状態へ反映しないこと', async () => {
+    const context = createContext({ SerialPort: createSerialPort({ device: () => '' }) });
+    await main.connect(context, '/dev/x', 9600);
+    context.enterCommandMode();
+    const result = main.readBoardInfo(context);
+    await flush();
+    main.resetProtocol(context);
+    const info = { mrubyc: 'v4.0', rite: 'RITE0400', error: null };
+    context.setBoardInfo(info);
+    await result;
+    assert.deepEqual(context.get().boardInfo, info);
+  });
+
+  it('送信前に切断された要求では通信しないこと', async () => {
+    const context = createContext();
+    await main.connect(context, '/dev/x', 9600);
+    context.enterCommandMode();
+    const port = context.get().serialPort;
+    const result = main.readBoardInfo(context);
+    await main.disconnect(context);
+    await result;
+    assert.deepEqual(port.written, []);
+    assert.equal(context.get().boardInfo, null);
+  });
+
+  it('実行モードではversionを送らないこと', async () => {
+    const context = createContext();
+    await main.connect(context, '/dev/x', 9600);
+    await main.readBoardInfo(context);
+    assert.deepEqual(context.get().serialPort.written, []);
+  });
+});
+
 describe('#writeBytecodes', () => {
   let context;
   beforeEach(async () => {
@@ -376,6 +512,18 @@ describe('#writeBytecodes', () => {
     await main.writeBytecodes(context, { libraries: [new Uint8Array([9])], tasks: [new Uint8Array([1])] });
     const commands = context.get().serialPort.written.filter((text) => text.startsWith('write'));
     assert.deepEqual(commands.map((text) => text.split(' ')[0]), ['write_lib', 'write']);
+    assert.deepEqual(commands, ['write_lib 1 623e\r\n', 'write 1 ee76\r\n']);
+  });
+
+  it('自動検証がONならwriteとwrite_libの第2引数にCRC16を付けること', async () => {
+    main.updateDevice(context, { autoVerify: true });
+    const bytecode = new Uint8Array([1, 2, 3]);
+    await main.writeBytecodes(context, { libraries: [bytecode], tasks: [bytecode] });
+    const commands = context.get().serialPort.written.filter((text) => text.startsWith('write'));
+    assert.deepEqual(commands, ['write_lib 3 a408\r\n', 'write 3 a408\r\n']);
+    main.updateDevice(context, { autoVerify: false });
+    await main.writeBytecodes(context, { libraries: [], tasks: [bytecode] });
+    assert.equal(context.get().serialPort.written.at(-2), 'write 3\r\n');
   });
 
   it('clearが失敗するとfalseを返すこと', async () => {
@@ -633,15 +781,15 @@ describe('#getSettings', () => {
   it('欠落キーを既定値で補うこと', () => {
     const context = createContext({ root });
     assert.deepEqual(main.getSettings(context), {
-      version: '4.0.0', port: null, baud: 115200, autoConnect: true, libraries: [], tasks: []
+      version: '4.0.0', autoDetect: true, port: null, baud: 115200, autoConnect: false, autoVerify: true, libraries: [], tasks: []
     });
   });
 
   it('保存された設定を返すこと', () => {
     writeProjectConfig(root, { compiler: { version: '3.4.0' }, libraries: [{ filename: 'lib.rb' }], tasks: [{ filename: 'main.rb' }] });
-    const context = createContext({ root, device: { port: '/dev/x', baud: 9600 } });
+    const context = createContext({ root, device: { port: '/dev/x', baud: 9600, autoDetect: false, autoVerify: false } });
     assert.deepEqual(main.getSettings(context), {
-      version: '3.4.0', port: '/dev/x', baud: 9600, autoConnect: true, libraries: [{ filename: 'lib.rb' }], tasks: [{ filename: 'main.rb' }]
+      version: '3.4.0', autoDetect: false, port: '/dev/x', baud: 9600, autoConnect: false, autoVerify: false, libraries: [{ filename: 'lib.rb' }], tasks: [{ filename: 'main.rb' }]
     });
   });
 
@@ -659,14 +807,14 @@ describe('#getSettings', () => {
   });
 });
 
-describe('#updateVersion', () => {
+describe('#updateCompiler', () => {
   let root;
   beforeEach(() => { root = makeWorkspace(); });
   afterEach(() => fs.rmSync(root, { recursive: true }));
 
   it('compiler.versionを書き込みビューを更新すること', () => {
     const context = createContext({ root });
-    main.updateVersion(context, '3.4.0');
+    main.updateCompiler(context, { version: '3.4.0' });
     assert.deepEqual(readProjectConfig(root), { compiler: { version: '3.4.0' } });
     assert.ok(context.vscode.commands.calls.length > 0);
   });
@@ -674,14 +822,14 @@ describe('#updateVersion', () => {
   it('他のキーを保持すること', () => {
     writeProjectConfig(root, { tasks: [{ filename: 'main.rb' }] });
     const context = createContext({ root });
-    main.updateVersion(context, '3.4.0');
+    main.updateCompiler(context, { version: '3.4.0' });
     assert.deepEqual(readProjectConfig(root), { tasks: [{ filename: 'main.rb' }], compiler: { version: '3.4.0' } });
   });
 
   it('ワークスペースを開いていなければ警告すること', () => {
     const warnings = [];
     const context = createContext({ window: { showWarningMessage: (message) => warnings.push(message) } });
-    main.updateVersion(context, '3.4.0');
+    main.updateCompiler(context, { version: '3.4.0' });
     assert.deepEqual(warnings, ['Kaniburner: プロジェクト設定を保存するにはフォルダを開いてください。']);
   });
 });
@@ -757,6 +905,63 @@ describe('#moveProjectEntry', () => {
   });
 });
 
+describe('#resolveCompilerVersion', () => {
+  let root, context;
+  beforeEach(async () => {
+    root = makeWorkspace();
+    context = createContext({ root });
+    await main.connect(context, '/dev/x', 9600);
+    context.enterCommandMode();
+  });
+  afterEach(() => fs.rmSync(root, { recursive: true }));
+
+  it('手動選択ではボード情報にかかわらず設定値を使うこと', () => {
+    main.updateDevice(context, { autoDetect: false });
+    context.setBoardInfo(main.parseBoardInfo('+OK mruby/c v3.3 RITE0300'));
+    assert.deepEqual(main.resolveCompilerVersion(context), { version: '4.0.0', warning: null });
+  });
+
+  it('自動判定ではRITE形式に対応するコンパイラへ切り替えること', () => {
+    main.updateCompiler(context, { version: '4.0.0' });
+    context.setBoardInfo(main.parseBoardInfo('+OK mruby/c v3.3 RITE0300'));
+    assert.deepEqual(main.resolveCompilerVersion(context), { version: '3.4.0', warning: null });
+    assert.equal(main.compilerDirectory(context), path.join('/ext', 'media', 'mruby-3.4.0'));
+    context.setBoardInfo(main.parseBoardInfo('+OK mruby/c v4.0 RITE0400'));
+    assert.deepEqual(main.resolveCompilerVersion(context), { version: '4.0.0', warning: null });
+    assert.deepEqual(readProjectConfig(root).compiler, { version: '4.0.0' });
+  });
+
+  it('取得後に自動判定を切り替えると使用バージョンも変わること', () => {
+    context.setBoardInfo(main.parseBoardInfo('+OK mruby/c v3.3 RITE0300'));
+    main.updateCompiler(context, { version: '4.0.0' });
+    assert.equal(main.resolveCompilerVersion(context).version, '3.4.0');
+    main.updateDevice(context, { autoDetect: false });
+    assert.deepEqual(main.resolveCompilerVersion(context), { version: '4.0.0', warning: null });
+    assert.equal(readProjectConfig(root).compiler.version, '4.0.0');
+  });
+
+  it('判定できなければ理由と手動設定のバージョンを返すこと', () => {
+    main.updateCompiler(context, { version: '3.4.0' });
+    for (const response of [null, '-ERR', '+OK mruby/c v3.3', '+OK mruby/c v3.3 RITE9999']) {
+      context.setBoardInfo(main.parseBoardInfo(response));
+      const selected = main.resolveCompilerVersion(context);
+      assert.equal(selected.version, '3.4.0');
+      assert.ok(selected.warning);
+      assert.equal(contextValues(context)['kaniburner.canWrite'], true);
+    }
+  });
+
+  it('切断後は手動設定へ戻り、Compileを使用できること', async () => {
+    main.updateCompiler(context, { version: '4.0.0' });
+    context.setBoardInfo(main.parseBoardInfo('+OK mruby/c v3.3 RITE0300'));
+    await main.disconnect(context);
+    const selected = main.resolveCompilerVersion(context);
+    assert.equal(selected.version, '4.0.0');
+    assert.match(selected.warning, /接続されていません/);
+    assert.equal(contextValues(context)['kaniburner.canCompile'], true);
+  });
+});
+
 describe('#compilerDirectory', () => {
   let root;
   beforeEach(() => { root = makeWorkspace(); });
@@ -775,6 +980,75 @@ describe('#compilerDirectory', () => {
 });
 
 const document = (fileName, text = '', isClosed = false) => ({ fileName, isClosed, getText: () => text });
+
+describe('#compileAndWrite', () => {
+  let root, context;
+  beforeEach(() => {
+    root = makeWorkspace();
+    installMrbc(path.join(root, 'media', 'mruby-3.4.0'));
+    installMrbc(path.join(root, 'media', 'mruby-4.0.0'));
+    context = createContext({ root, extensionPath: root, window: {
+      activeTextEditor: { document: document(path.join(root, 'main.rb'), 'task') }
+    } });
+  });
+  afterEach(() => fs.rmSync(root, { recursive: true }));
+
+  it('未接続ならコンパイルだけを行うこと', async () => {
+    await main.compileAndWrite(context);
+    assert.equal(context.SerialPort.instances.length, 0);
+    assert.equal(context.get().mrbcDirectory, path.join(root, 'media', 'mruby-4.0.0'));
+    assert.ok(context.output.lines.includes('[info]  Compile succeeded. (4 bytes)'));
+  });
+
+  it('接続中は判定してからコンパイル・書き込みを行うこと', async () => {
+    await main.connect(context, '/dev/x', 9600);
+    context.enterCommandMode();
+    await main.compileAndWrite(context);
+    assert.equal(context.get().mrbcDirectory, path.join(root, 'media', 'mruby-3.4.0'));
+    assert.ok(context.output.lines.includes('[info]  Compiling (mruby 3.4.0)...'));
+    assert.deepEqual(context.get().serialPort.written, ['version\r\n', 'clear\r\n', 'write 4 8fbe\r\n', 'task']);
+  });
+
+  it('判定が失敗しても設定中のコンパイラで書き込むこと', async () => {
+    context.SerialPort = createSerialPort({ device: (text) => text === 'version\r\n' ? '-ERR Illegal command.\r\n' : mrbwriteDevice(text) });
+    await main.connect(context, '/dev/x', 9600);
+    context.enterCommandMode();
+    await main.compileAndWrite(context);
+    assert.equal(context.get().mrbcDirectory, path.join(root, 'media', 'mruby-4.0.0'));
+    assert.ok(main.resolveCompilerVersion(context).warning);
+    assert.deepEqual(context.get().serialPort.written, ['version\r\n', 'clear\r\n', 'write 4 8fbe\r\n', 'task']);
+  });
+
+  it('判定がタイムアウトしても書き込みを続行すること', async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    context.SerialPort = createSerialPort({ device: (text) => text === 'version\r\n' ? '' : mrbwriteDevice(text) });
+    await main.connect(context, '/dev/x', 9600);
+    context.enterCommandMode();
+    const result = main.compileAndWrite(context);
+    await advance(t, 5000);
+    await result;
+    assert.equal(context.get().mrbcDirectory, path.join(root, 'media', 'mruby-4.0.0'));
+    assert.ok(context.output.lines.includes('[info]  Write completed.'));
+  });
+
+  it('コンパイル失敗時はclearもwriteも送らないこと', async () => {
+    context.vscode.window.activeTextEditor.document = document(path.join(root, 'main.rb'), 'fail');
+    await main.connect(context, '/dev/x', 9600);
+    context.enterCommandMode();
+    await main.compileAndWrite(context);
+    assert.deepEqual(context.get().serialPort.written, ['version\r\n']);
+  });
+
+  it('コンパイル中に切断されたら書き込まないこと', async () => {
+    await main.connect(context, '/dev/x', 9600);
+    context.enterCommandMode();
+    const port = context.get().serialPort;
+    await main.readBoardInfo(context);
+    context.output.append = () => { main.disconnect(context); };
+    await main.compileAndWrite(context);
+    assert.deepEqual(port.written, ['version\r\n']);
+  });
+});
 
 describe('#workspaceRoot', () => {
   it('最初のワークスペースフォルダのパスを返すこと', () => {
@@ -1098,7 +1372,7 @@ describe('#ensureReady', () => {
   it('直接コマンドモードへ入れなければリセットして入り直すこと', async (t) => {
     t.mock.timers.enable({ apis: ['setTimeout'] });
     let attempts = 0;
-    const device = (text) => (text === '\r\n' && ++attempts > 3 ? '+OK mruby/c\r\n' : '');
+    const device = (text) => (text === '\r\n' ? (++attempts > 3 ? '+OK mruby/c\r\n' : '') : mrbwriteDevice(text));
     const context = createContext({ device: { port: '/dev/x' }, SerialPort: createSerialPort({ ports: [{ path: '/dev/x' }], device }) });
     const result = main.ensureReady(context);
     for (let second = 0; second < 3; second++) await advance(t, 1000);
@@ -1114,22 +1388,36 @@ describe('#ensureReady', () => {
 });
 
 describe('#autoConnectEnabled', () => {
-  it('既定では有効になること', () => {
-    assert.equal(main.autoConnectEnabled(createContext({ device: { port: '/dev/x' } })), true);
+  it('既定では無効になること', () => {
+    assert.equal(main.autoConnectEnabled(createContext({ device: { port: '/dev/x' } })), false);
   });
 
   it('ポートが未設定なら無効になること', () => {
-    assert.equal(main.autoConnectEnabled(createContext({ device: { autoConnect: true } })), false);
+    const context = createContext();
+    context.setAutoConnect(true);
+    assert.equal(main.autoConnectEnabled(context), false);
   });
 
-  it('明示的に無効にできること', () => {
-    assert.equal(main.autoConnectEnabled(createContext({ device: { port: '/dev/x', autoConnect: false } })), false);
+  it('明示的に切り替え、次の起動には引き継がないこと', () => {
+    const context = createContext({ device: { port: '/dev/x' } });
+    context.setAutoConnect(true);
+    assert.equal(main.autoConnectEnabled(context), true);
+    assert.equal(main.getSettings(context).autoConnect, true);
+    assert.deepEqual(context.storage.data['kaniburner.device'], { port: '/dev/x' });
+    const restarted = main.buildContext(context);
+    assert.equal(main.autoConnectEnabled(restarted), false);
+    assert.equal(main.getSettings(restarted).autoConnect, false);
+    context.setAutoConnect(false);
+    assert.equal(main.autoConnectEnabled(context), false);
   });
 });
 
 describe('#pollAutoConnect', () => {
-  const createPollContext = (device, ports = [{ path: '/dev/x' }]) =>
-    createContext({ device, SerialPort: createSerialPort({ ports }) });
+  const createPollContext = (device, ports = [{ path: '/dev/x' }]) => {
+    const context = createContext({ device, SerialPort: createSerialPort({ ports }) });
+    context.setAutoConnect(true);
+    return context;
+  };
 
   it('設定のポートが現れたら接続してコマンドモードへ入ること', async (t) => {
     t.mock.timers.enable({ apis: ['setTimeout'] });
@@ -1171,10 +1459,36 @@ describe('#pollAutoConnect', () => {
     assert.equal(context.SerialPort.instances.length, 0);
   });
 
-  it('無効なら何もしないこと', async () => {
-    const context = createPollContext({ port: '/dev/x', autoConnect: false });
+  it('無効ならポート一覧も取得しないこと', async (t) => {
+    const context = createPollContext({ port: '/dev/x' });
+    context.setAutoConnect(false);
+    const list = t.mock.method(context.SerialPort, 'list');
     await main.pollAutoConnect(context);
+    assert.equal(list.mock.callCount(), 0);
     assert.equal(context.SerialPort.instances.length, 0);
+  });
+
+  it('ポート一覧の取得中に無効にされた場合は接続しないこと', async (t) => {
+    const context = createPollContext({ port: '/dev/x' });
+    let resolve;
+    t.mock.method(context.SerialPort, 'list', () => new Promise((callback) => { resolve = callback; }));
+    const result = main.pollAutoConnect(context);
+    context.setAutoConnect(false);
+    resolve([{ path: '/dev/x' }]);
+    await result;
+    assert.equal(context.SerialPort.instances.length, 0);
+  });
+
+  it('有効にし直した場合はポートの出現を再確認すること', async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    const context = createPollContext({ port: '/dev/x' });
+    context.setPortPresent(true);
+    context.setAutoConnect(false);
+    context.setAutoConnect(true);
+    const result = main.pollAutoConnect(context);
+    await advance(t, 1000);
+    await result;
+    assert.equal(context.get().serialPort.path, '/dev/x');
   });
 
   it('接続に失敗してもエラーとして記録しないこと', async () => {
@@ -1182,6 +1496,7 @@ describe('#pollAutoConnect', () => {
       device: { port: '/dev/x' },
       SerialPort: createSerialPort({ ports: [{ path: '/dev/x' }], openError: new Error('busy') })
     });
+    context.setAutoConnect(true);
     await main.pollAutoConnect(context);
     assert.equal(context.get().serialPort, null);
     assert.ok(!context.output.lines.some((line) => line.startsWith('[error]')));
@@ -1214,13 +1529,16 @@ describe('#buildDeviceView', () => {
   beforeEach(() => { root = makeWorkspace(); });
   afterEach(() => fs.rmSync(root, { recursive: true }));
 
-  it('ポート・ボーレート・自動接続・バージョンの行を返すこと', () => {
+  it('接続先・VM・コンパイラ・オプションの行を返すこと', () => {
     const context = createContext({ root, device: { port: '/dev/x', baud: 9600 } });
     assert.deepEqual(main.buildDeviceView(context).map((item) => [item.label, item.description, item.contextValue]), [
       ['Port', '/dev/x', 'devicePort'],
+      ['mruby/c VM', '(not connected)', 'deviceVmVersion'],
       ['Baud', '9600', 'deviceBaud'],
       ['Auto connect', undefined, 'deviceAutoConnect'],
-      ['mruby', '4.0.0', 'deviceVersion']
+      ['mruby', '4.0.0', 'deviceVersion'],
+      ['Auto detect compiler', undefined, 'deviceAutoDetect'],
+      ['Auto verify', undefined, 'deviceAutoVerify']
     ]);
   });
 
@@ -1230,17 +1548,77 @@ describe('#buildDeviceView', () => {
 
   it('コンパイラが無いバージョンには警告を付けること', () => {
     writeProjectConfig(root, { compiler: { version: '9.9.9' } });
-    const version = main.buildDeviceView(createContext({ root }))[3];
+    const version = main.buildDeviceView(createContext({ root }))[4];
     assert.equal(version.description, '9.9.9 (not found)');
     assert.equal(version.iconPath.id, 'warning');
     assert.equal(version.iconPath.color.id, 'errorForeground');
   });
 
-  it('自動接続の保存値をチェックボックスに出すこと', () => {
-    const checkbox = (device) => main.buildDeviceView(createContext({ root, device }))[2].checkboxState;
-    assert.equal(checkbox({ port: '/dev/x' }), 1);
-    assert.equal(checkbox({ port: '/dev/x', autoConnect: false }), 0);
-    assert.equal(checkbox({ autoConnect: true }), 1);
+  it('自動接続の状態をチェックボックスに出すこと', () => {
+    const context = createContext({ root, device: { port: '/dev/x' } });
+    const checkbox = () => main.buildDeviceView(context)[3].checkboxState;
+    assert.equal(checkbox(), 0);
+    context.setAutoConnect(true);
+    assert.equal(checkbox(), 1);
+    context.setAutoConnect(false);
+    assert.equal(checkbox(), 0);
+  });
+
+  it('自動判定の保存値をチェックボックスに出すこと', () => {
+    const checkbox = (device) => main.buildDeviceView(createContext({ root, device }))[5].checkboxState;
+    assert.equal(checkbox({}).state, 1);
+    assert.equal(checkbox({ autoDetect: true }).state, 1);
+    assert.equal(checkbox({ autoDetect: false }), 0);
+  });
+
+  it('自動検証の保存値をチェックボックスに出すこと', () => {
+    const checkbox = (device) => main.buildDeviceView(createContext({ root, device }))[6].checkboxState;
+    assert.equal(checkbox({}), 1);
+    assert.equal(checkbox({ autoVerify: true }), 1);
+    assert.equal(checkbox({ autoVerify: false }), 0);
+  });
+
+  it('VMのバージョンを接続先の下に編集操作なしで表示すること', async () => {
+    const context = createContext({ root, device: { port: '/dev/x' } });
+    await main.connect(context, '/dev/x', 9600);
+    context.enterCommandMode();
+    await main.readBoardInfo(context);
+    const item = main.buildDeviceView(context)[1];
+    assert.equal(item.description, 'v3.3');
+    assert.equal(item.command, undefined);
+    assert.match(item.tooltip, /\/dev\/x/);
+    await main.disconnect(context);
+    assert.equal(main.buildDeviceView(context)[1].description, '(not connected)');
+  });
+
+  it('VM情報を取得できない原因をホバーに表示すること', async () => {
+    const context = createContext({ root });
+    await main.connect(context, '/dev/x', 9600);
+    context.setBoardInfo(main.parseBoardInfo('-ERR Illegal command.'));
+    const item = main.buildDeviceView(context)[1];
+    assert.equal(item.description, '(unknown)');
+    assert.equal(item.iconPath.id, 'warning');
+    assert.match(item.tooltip, /Illegal command/);
+  });
+
+  it('自動判定の警告をチェックボックス付近とホバーに表示すること', async () => {
+    const context = createContext({ root });
+    await main.connect(context, '/dev/x', 9600);
+    context.enterCommandMode();
+    context.setBoardInfo(main.parseBoardInfo('+OK mruby/c v3.3 RITE9999'));
+    const item = main.buildDeviceView(context)[5];
+    assert.equal(item.checkboxState.state, 1);
+    assert.equal(item.iconPath.id, 'warning');
+    assert.equal(item.iconPath.color.id, 'editorWarning.foreground');
+    assert.match(item.tooltip, /RITE9999/);
+    assert.match(item.tooltip, /mruby 4\.0\.0を使用/);
+    assert.equal(item.checkboxState.tooltip, item.tooltip);
+    assert.equal(contextValues(context)['kaniburner.canWrite'], true);
+    context.setBoardInfo(main.parseBoardInfo('+OK mruby/c v3.3 RITE0300'));
+    const items = main.buildDeviceView(context);
+    assert.equal(items[4].description, '3.4.0');
+    assert.equal(items[5].iconPath.id, 'sync');
+    assert.equal(items[5].tooltip, undefined);
   });
 
   it('子要素は持たないこと', () => {
@@ -1304,7 +1682,7 @@ describe('#refreshButtons', () => {
     main.refreshButtons(context);
     assert.deepEqual(contextValues(context), {
       'kaniburner.connected': false,
-      'kaniburner.canExecuteAll': false, 'kaniburner.canCompile': true, 'kaniburner.canConnect': true,
+      'kaniburner.canCompile': true, 'kaniburner.canConnect': true,
       'kaniburner.canDisconnect': false, 'kaniburner.canWrite': false, 'kaniburner.canExecute': false,
       'kaniburner.canReset': false
     });
@@ -1315,7 +1693,7 @@ describe('#refreshButtons', () => {
     await main.connect(context, '/dev/x', 9600);
     main.refreshButtons(context);
     const values = contextValues(context);
-    assert.equal(values['kaniburner.canExecuteAll'], true);
+    assert.equal(values['kaniburner.canCompile'], false);
     assert.equal(values['kaniburner.canReset'], true);
     assert.equal(values['kaniburner.canWrite'], false);
     assert.equal(values['kaniburner.canExecute'], false);
@@ -1331,7 +1709,7 @@ describe('#refreshButtons', () => {
     assert.equal(values['kaniburner.canExecute'], true);
   });
 
-  it('コンパイラが無ければCompile・Write・ExecuteAllを押せないこと', async () => {
+  it('コンパイラが無ければCompile・Writeを押せないこと', async () => {
     writeProjectConfig(root, { compiler: { version: '9.9.9' } });
     const context = createContext({ root });
     await main.connect(context, '/dev/x', 9600);
@@ -1340,7 +1718,6 @@ describe('#refreshButtons', () => {
     const values = contextValues(context);
     assert.equal(values['kaniburner.canCompile'], false);
     assert.equal(values['kaniburner.canWrite'], false);
-    assert.equal(values['kaniburner.canExecuteAll'], false);
     assert.equal(values['kaniburner.canExecute'], true);
   });
 
@@ -1389,6 +1766,15 @@ describe('#selectVersion', () => {
     const context = createContext({ root, window: { showQuickPick: async () => undefined } });
     await main.selectVersion(context);
     assert.equal(fs.existsSync(path.join(root, '.vscode/kaniburner.json')), false);
+    assert.deepEqual(context.storage.data['kaniburner.device'], {});
+  });
+
+  it('手動で選び直した場合は自動判定をOFFにすること', async () => {
+    writeProjectConfig(root, { compiler: { version: '4.0.0' } });
+    const context = createContext({ root, device: { autoDetect: true }, window: { showQuickPick: async () => '3.4.0' } });
+    await main.selectVersion(context);
+    assert.deepEqual(readProjectConfig(root).compiler, { version: '3.4.0' });
+    assert.equal(context.storage.data['kaniburner.device'].autoDetect, false);
   });
 });
 
@@ -1507,5 +1893,91 @@ describe('#uriArguments', () => {
 
   it('URI以外なら空になること', () => {
     assert.deepEqual(main.uriArguments(createContext(), { key: 'tasks' }, undefined), []);
+  });
+});
+
+describe('#activate', () => {
+  it('登録された操作でコンパイル・接続・設定変更・書き込みを行えること', async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout', 'setInterval'] });
+    const root = makeWorkspace();
+    t.after(() => fs.rmSync(root, { recursive: true }));
+    for (const version of ['3.4.0', '4.0.0']) installMrbc(path.join(root, 'media', `mruby-${version}`));
+    const context = createContext({ root, extensionPath: root, device: { port: '/dev/x' }, window: {
+      activeTextEditor: { document: document(path.join(root, 'main.rb'), 'task') }
+    } });
+    const api = context.vscode;
+    const registered = new Map();
+    const disposable = { dispose() {} };
+    let deviceProvider, changeCheckbox;
+    context.output.dispose = () => {};
+    api.window.createOutputChannel = () => context.output;
+    api.window.onDidChangeActiveTextEditor = () => disposable;
+    api.window.registerTreeDataProvider = () => disposable;
+    api.window.createTreeView = (_, { treeDataProvider }) => {
+      deviceProvider = treeDataProvider;
+      return { ...disposable, onDidChangeCheckboxState: (handler) => { changeCheckbox = handler; return disposable; } };
+    };
+    api.workspace.createFileSystemWatcher = () => ({
+      ...disposable, onDidChange: () => disposable, onDidCreate: () => disposable, onDidDelete: () => disposable
+    });
+    api.commands.registerCommand = (id, handler) => { registered.set(id, handler); return disposable; };
+    const Module = require('node:module');
+    const load = Module._load;
+    t.mock.method(Module, '_load', function (id, ...args) {
+      if (id === 'vscode') return api;
+      if (id === 'serialport') return { SerialPort: context.SerialPort };
+      return load.call(this, id, ...args);
+    });
+    const extensionContext = { extensionPath: root, workspaceState: context.storage, subscriptions: [] };
+    main.activate(extensionContext);
+    t.after(async () => {
+      await main.deactivate();
+      for (const subscription of extensionContext.subscriptions) subscription.dispose();
+    });
+    const manifest = require('../package.json');
+    assert.deepEqual([...registered.keys()].sort(), manifest.contributes.commands.map(({ command }) => command).sort());
+    assert.equal(registered.has('kaniburner.executeAll'), false);
+    const item = (contextValue) => deviceProvider.getChildren().find((entry) => entry.contextValue === contextValue);
+    assert.equal(item('deviceAutoConnect').checkboxState, 0);
+    assert.equal(item('deviceAutoDetect').checkboxState.state, 1);
+    assert.equal(item('deviceAutoVerify').checkboxState, 1);
+    const list = t.mock.method(context.SerialPort, 'list');
+    await advance(t, 1000);
+    assert.equal(list.mock.callCount(), 0);
+    changeCheckbox({ items: [[item('deviceAutoConnect'), 1]] });
+    assert.equal(item('deviceAutoConnect').checkboxState, 1);
+    assert.deepEqual(context.storage.data['kaniburner.device'], { port: '/dev/x' });
+    changeCheckbox({ items: [[item('deviceAutoConnect'), 0]] });
+    assert.equal(item('deviceAutoConnect').checkboxState, 0);
+    await registered.get('kaniburner.compile')();
+    assert.equal(context.SerialPort.instances.length, 0);
+    assert.ok(context.output.lines.includes('[info]  Compile succeeded. (4 bytes)'));
+
+    const connection = registered.get('kaniburner.connect')();
+    await advance(t, 1000);
+    await connection;
+    assert.equal(contextValues(context)['kaniburner.connected'], true);
+    assert.equal(contextValues(context)['kaniburner.canCompile'], false);
+    assert.equal(contextValues(context)['kaniburner.canWrite'], true);
+    assert.equal(item('deviceVmVersion').description, 'v3.3');
+    changeCheckbox({ items: [[item('deviceAutoDetect'), 0], [item('deviceAutoVerify'), 0]] });
+    assert.equal(context.storage.data['kaniburner.device'].autoDetect, false);
+    assert.equal(context.storage.data['kaniburner.device'].autoVerify, false);
+    assert.equal(item('deviceVersion').description, '4.0.0');
+    changeCheckbox({ items: [[item('deviceAutoDetect'), 1], [item('deviceAutoVerify'), 1]] });
+    assert.equal(context.storage.data['kaniburner.device'].autoDetect, true);
+    assert.equal(context.storage.data['kaniburner.device'].autoVerify, true);
+    assert.equal(context.storage.data['kaniburner.device'].autoConnect, undefined);
+    assert.equal(fs.existsSync(path.join(root, '.vscode/kaniburner.json')), false);
+    assert.equal(item('deviceVersion').description, '3.4.0');
+    await registered.get('kaniburner.write')();
+    const port = context.SerialPort.instances[0];
+    assert.match(port.written.at(-2), /^write 4 [0-9a-f]{4}\r\n$/);
+    assert.equal(port.written.at(-1), 'task');
+    assert.ok(!port.written.includes('execute\r\n'));
+    await registered.get('kaniburner.disconnect')();
+    assert.equal(contextValues(context)['kaniburner.canCompile'], true);
+    assert.equal(contextValues(context)['kaniburner.canWrite'], false);
+    assert.equal(item('deviceVmVersion').description, '(not connected)');
   });
 });
