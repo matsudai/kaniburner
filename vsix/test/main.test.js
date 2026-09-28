@@ -58,9 +58,10 @@ function mrbwriteDevice(text) {
  *
  * @param ports list()が返すポート一覧。
  * @param openError 接続時に返すエラー。
+ * @param setError 制御信号の設定時に返すエラー。
  * @param device 書き込みに対して同期的に返信する関数。
  */
-function createSerialPort({ ports = [], openError = null, device = mrbwriteDevice } = {}) {
+function createSerialPort({ ports = [], openError = null, setError = null, device = mrbwriteDevice } = {}) {
   return class SerialPort {
     static instances = [];
     static list() { return Promise.resolve(ports); }
@@ -85,7 +86,7 @@ function createSerialPort({ ports = [], openError = null, device = mrbwriteDevic
       if (reply) this.receive(reply);
     }
 
-    set(options, callback) { this.sets.push(options); callback(); }
+    set(options, callback) { this.sets.push(options); callback(setError); }
 
     close(callback) {
       this.closed = true;
@@ -333,6 +334,7 @@ describe('#ensureCommandMode', () => {
     await advance(t, 1000);
     assert.equal(await result, true);
     assert.deepEqual(context.get().serialPort.written, ['\r\n']);
+    assert.ok(context.output.lines.includes('[info]  Entering command mode... (1/3)'));
   });
 
   it('再試行を使い切るとfalseを返すこと', async (t) => {
@@ -344,6 +346,10 @@ describe('#ensureCommandMode', () => {
     await advance(t, 1000);
     assert.equal(await result, false);
     assert.deepEqual(context.get().serialPort.written, ['\r\n', '\r\n']);
+    assert.deepEqual(context.output.lines.slice(0, 2), [
+      '[info]  Entering command mode... (1/2)',
+      '[info]  Entering command mode... (2/2)'
+    ]);
     assert.ok(context.output.lines.includes('[error] Command mode transition timed out (2s).'));
   });
 
@@ -574,6 +580,7 @@ describe('#connect', () => {
     await main.connect(context, '/dev/fake', 9600);
     assert.equal(context.get().serialPort.path, '/dev/fake');
     assert.equal(context.get().serialPort.baudRate, 9600);
+    assert.deepEqual(context.get().serialPort.sets, [{ brk: false, dtr: true, rts: true }]);
     assert.equal(main.connected(context), true);
   });
 
@@ -588,6 +595,14 @@ describe('#connect', () => {
   it('開けなかった場合はrejectし、未接続のままにすること', async () => {
     const context = createContext({ SerialPort: createSerialPort({ openError: new Error('busy') }) });
     await assert.rejects(main.connect(context, '/dev/fake', 9600), { message: 'busy' });
+    assert.equal(main.connected(context), false);
+  });
+
+  it('制御信号を設定できなかった場合はポートを閉じてrejectすること', async () => {
+    const SerialPort = createSerialPort({ setError: new Error('set failed') });
+    const context = createContext({ SerialPort });
+    await assert.rejects(main.connect(context, '/dev/fake', 9600), { message: 'set failed' });
+    assert.equal(SerialPort.instances[0].closed, true);
     assert.equal(main.connected(context), false);
   });
 });
@@ -655,7 +670,11 @@ describe('#sendBreak', () => {
     const context = createContext();
     await main.connect(context, '/dev/fake', 9600);
     await main.sendBreak(context);
-    assert.deepEqual(context.get().serialPort.sets, [{ brk: true }, { brk: false }]);
+    assert.deepEqual(context.get().serialPort.sets, [
+      { brk: false, dtr: true, rts: true },
+      { brk: true, dtr: true, rts: true },
+      { brk: false, dtr: true, rts: true }
+    ]);
   });
 
   it('未接続なら何もしないこと', async () => {
@@ -1332,7 +1351,11 @@ describe('#resetAndReconnect', () => {
     const first = context.get().serialPort;
     const result = main.resetAndReconnect(context);
     await advance(t, 100);
-    assert.deepEqual(first.sets, [{ brk: true }, { brk: false }]);
+    assert.deepEqual(first.sets, [
+      { brk: false, dtr: true, rts: true },
+      { brk: true, dtr: true, rts: true },
+      { brk: false, dtr: true, rts: true }
+    ]);
     assert.ok(context.output.lines.includes('[info]  > break'));
     first.listeners.close();
     await advance(t, 1000);
@@ -1378,7 +1401,11 @@ describe('#ensureReady', () => {
     for (let second = 0; second < 3; second++) await advance(t, 1000);
     const first = context.get().serialPort;
     await advance(t, 100);
-    assert.deepEqual(first.sets, [{ brk: true }, { brk: false }]);
+    assert.deepEqual(first.sets, [
+      { brk: false, dtr: true, rts: true },
+      { brk: true, dtr: true, rts: true },
+      { brk: false, dtr: true, rts: true }
+    ]);
     first.listeners.close();
     await advance(t, 1000);
     await advance(t, 1000);

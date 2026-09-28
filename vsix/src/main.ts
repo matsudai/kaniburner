@@ -13,6 +13,7 @@ const RITE_COMPILERS: Record<string, string> = { RITE0300: '3.4.0', RITE0400: '4
 const DEFAULT_VERSION = '4.0.0';
 const DEFAULT_BAUD = 115200;
 const PROJECT_CONFIG_FILENAME = '.vscode/kaniburner.json';
+const CONNECT_RETRIES = 10;
 /** 自動接続のためにポート一覧を見る間隔。 */
 const AUTO_CONNECT_INTERVAL = 1000;
 
@@ -292,8 +293,8 @@ export async function sendCommand(context: Context, command: string, { ignoreRes
  */
 export async function ensureCommandMode(context: Context, retries = 30): Promise<boolean> {
   if (context.get().commandMode) return true;
-  logInfo(context, 'Entering command mode...');
   for (let attempt = 0; attempt < retries; attempt++) {
+    logInfo(context, `Entering command mode... (${attempt + 1}/${retries})`);
     try {
       await sendText(context, '\r\n');
     } catch (error) {
@@ -431,11 +432,14 @@ export function connect(context: Context, portPath: string, baudRate: number): P
   return new Promise((resolve, reject) => {
     const port = new context.SerialPort({ path: portPath, baudRate }, (error) => {
       if (error) return reject(error);
-      context.setSerialPort(port);
       port.on('data', (buffer: Buffer) => feed(context, new Uint8Array(buffer)));
       port.on('close', () => onClose(context));
       port.on('error', () => {});
-      resolve();
+      port.set({ brk: false, dtr: true, rts: true }, (error) => {
+        if (error) return port.close(() => reject(error));
+        context.setSerialPort(port);
+        resolve();
+      });
     });
   });
 }
@@ -469,8 +473,8 @@ export function sendBreak(context: Context): Promise<void> {
   return new Promise((resolve) => {
     const port = context.get().serialPort;
     if (!port) return resolve();
-    port.set({ brk: true }, () => {
-      setTimeout(() => port.set({ brk: false }, () => resolve()), 100);
+    port.set({ brk: true, dtr: true, rts: true }, () => {
+      setTimeout(() => port.set({ brk: false, dtr: true, rts: true }, () => resolve()), 100);
     });
   });
 }
@@ -956,7 +960,7 @@ export async function pollAutoConnect(context: Context) {
   try {
     await connect(context, port as string, baud);
     logInfo(context, 'Auto-connected.');
-    await prepareDevice(context, 3);
+    await prepareDevice(context, CONNECT_RETRIES);
   } catch { /* 挿された直後は開けないことがある。次に挿し直された時へ委ねる。 */ }
   finally { context.endAction(); }
 }
@@ -1286,7 +1290,7 @@ export function activate(extensionContext: vscode.ExtensionContext) {
       return;
     }
     if (!await ensureConnected(context)) return;
-    await prepareDevice(context, 3);
+    await prepareDevice(context, CONNECT_RETRIES);
   }));
 
   register('kaniburner.disconnect', async () => {
