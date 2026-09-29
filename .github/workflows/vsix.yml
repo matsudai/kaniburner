@@ -1,0 +1,38 @@
+name: Package VSIX
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate tag format
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          if [[ ! "$TAG" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9]+)?$ ]]; then
+            echo "::error::Tag '$TAG' does not match the expected format '<x.y.z>' or '<x.y.z>-<n>' (no 'v' prefix)."
+            exit 1
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build the build image
+        run: docker build -t localhost/kaniburner --build-arg uid=$(id -u) --build-arg gid=$(id -g) .
+
+      - name: Package .vsix
+        run: |
+          docker run --rm -v "$PWD":/workspaces/kaniburner localhost/kaniburner \
+            bash -c "make -C vsix install && make -C vsix"
+
+      - name: Upload .vsix to GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: gh release upload "$TAG" vsix/*.vsix --clobber

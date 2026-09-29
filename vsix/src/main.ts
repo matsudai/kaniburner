@@ -1,0 +1,1305 @@
+/**
+ * Kaniburner VS Code拡張。
+ * mrbwriteプロトコル、mrbc(WASM)によるコンパイル、シリアル通信、UIを持つ。
+ */
+import type * as vscode from 'vscode';
+import type { SerialPort } from 'serialport';
+import * as path from 'node:path';
+import * as fs from 'node:fs';
+
+/** MakefileのMRUBY_VERSIONSと一致させる。 */
+const AVAILABLE_VERSIONS = ['3.4.0', '4.0.0'];
+const RITE_COMPILERS: Record<string, string> = { RITE0300: '3.4.0', RITE0400: '4.0.0' };
+const DEFAULT_VERSION = '4.0.0';
+const DEFAULT_BAUD = 115200;
+const PROJECT_CONFIG_FILENAME = '.vscode/kaniburner.json';
+const CONNECT_RETRIES = 10;
+/** 自動接続のためにポート一覧を見る間隔。 */
+const AUTO_CONNECT_INTERVAL = 1000;
+
+type ProjectKey = 'libraries' | 'tasks';
+
+/** filenameはワークスペースルートからの相対パス。 */
+interface Entry {
+  filename: string;
+}
+
+/** ユーザーストレージに保存する設定。 */
+interface DeviceConfig {
+  port?: string;
+  baud?: number;
+  autoDetect?: boolean;
+  autoVerify?: boolean;
+}
+
+/** プロジェクト設定ファイルに保存する設定。 */
+interface ProjectConfig {
+  compiler?: { version?: string };
+  libraries?: Entry[];
+  tasks?: Entry[];
+}
+
+interface Settings {
+  version: string;
+  autoDetect: boolean;
+  port: string | null;
+  baud: number;
+  autoConnect: boolean;
+  autoVerify: boolean;
+  libraries: Entry[];
+  tasks: Entry[];
+}
+
+interface Source {
+  filename: string;
+  source: string;
+}
+
+interface Bytecodes {
+  libraries: Uint8Array[];
+  tasks: Uint8Array[];
+}
+
+interface BoardInfo {
+  mrubyc: string | null;
+  rite: string | null;
+  error: string | null;
+}
+
+interface VersionSelection {
+  version: string;
+  warning: string | null;
+}
+
+/** ツリーの行をコマンド側で識別するための情報。 */
+type Item = vscode.TreeItem & { key?: ProjectKey; index?: number };
+
+type Provider = vscode.TreeDataProvider<Item> & { refresh(): void };
+
+/** mrbc.jsが公開するEmscriptenモジュール。 */
+interface MrbcModule {
+  FS: {
+    writeFile(path: string, data: string): void;
+    unlink(path: string): void;
+    readFile(path: string): Uint8Array;
+  };
+  callMain(args: string[]): number;
+}
+
+type MrbcFactory = (options: Record<string, unknown>) => Promise<MrbcModule>;
+
+/** activateで注入する依存。 */
+export interface Dependencies {
+  vscode: typeof vscode;
+  SerialPort: typeof SerialPort;
+  storage: vscode.Memento;
+  extensionPath: string;
+  output: vscode.OutputChannel;
+}
+
+/** 手続きが書き換える状態。 */
+export interface State {
+  lastRubyDocument: vscode.TextDocument | null;
+  /* mrbwriteプロトコル */
+  pending: string;
+  commandMode: boolean;
+  lastCommand: string | null;
+  responseResolve: ((line: string | null) => void) | null;
+  boardInfo: BoardInfo | null;
+  boardInfoRequest: Promise<void> | null;
+  /* シリアル通信 */
+  serialPort: SerialPort | null;
+  autoConnect: boolean;
+  /** 前回の監視で設定のポートが見えていたか。挿された瞬間だけ自動接続するために持つ。 */
+  portPresent: boolean;
+  /* mrbcコンパイラ */
+  mrbc: MrbcModule | null;
+  mrbcDirectory: string | null;
+  /** 実行中の操作数。コマンドパレットからは同時に走りうるため数える。 */
+  running: number;
+}
+
+export interface Context extends Dependencies {
+  projectProvider: Provider;
+  deviceProvider: Provider;
+  get(): State;
+  /* 状態の変更 */
+  rememberEditor(editor: vscode.TextEditor | undefined): void;
+  setPending(pending: string): void;
+  enterCommandMode(): void;
+  exitCommandMode(): void;
+  beginExecute(): void;
+  expectResponse(resolve: (line: string | null) => void): void;
+  clearResponse(): void;
+  clearProtocol(): void;
+  setBoardInfo(info: BoardInfo): void;
+  setBoardInfoRequest(request: Promise<void> | null): void;
+  setSerialPort(port: SerialPort | null): void;
+  setAutoConnect(autoConnect: boolean): void;
+  setPortPresent(present: boolean): void;
+  setMrbc(mrbc: MrbcModule, directory: string): void;
+  beginAction(): void;
+  endAction(): void;
+  writeProjectConfig(config: ProjectConfig): void;
+  writeDeviceConfig(config: DeviceConfig): void;
+}
+
+const sleep = (milliseconds: number) => new Promise((resolve) => setTimeout(resolve, milliseconds));
+
+export const logInfo = (context: Context, message: string) => context.output.appendLine(`[info]  ${message}`);
+export const logError = (context: Context, message: string) => { context.output.appendLine(`[error] ${message}`); context.output.show(true); };
+
+/** 状態の変更は遷移関数で行い、描画に効くものは描画も更新する。 */
+export function buildContext(dependencies: Dependencies): Context {
+  let state: State = {
+    lastRubyDocument: null,
+    pending: '',
+    commandMode: false,
+    lastCommand: null,
+    responseResolve: null,
+    boardInfo: null,
+    boardInfoRequest: null,
+    serialPort: null,
+    autoConnect: false,
+    portPresent: false,
+    mrbc: null,
+    mrbcDirectory: null,
+    running: 0
+  };
+  const update = (transition: (state: State) => State) => { state = transition(state); };
+  const context: Context = {
+    ...dependencies,
+    projectProvider: createProvider(dependencies.vscode, (element) => buildProjectView(context, element)),
+    deviceProvider: createProvider(dependencies.vscode, (element) => buildDeviceView(context, element)),
+    get: () => state,
+    rememberEditor: (editor) => update((state) => rememberEditor(state, editor)),
+    setPending: (pending) => update((state) => setPending(state, pending)),
+    enterCommandMode: () => { update(enterCommandMode); refreshAll(context); },
+    exitCommandMode: () => { update(exitCommandMode); refreshAll(context); },
+    beginExecute: () => update(beginExecute),
+    expectResponse: (resolve) => update((state) => expectResponse(state, resolve)),
+    clearResponse: () => update(clearResponse),
+    clearProtocol: () => { update(clearProtocol); refreshAll(context); },
+    setBoardInfo: (info) => { update((state) => setBoardInfo(state, info)); refreshAll(context); },
+    setBoardInfoRequest: (request) => { update((state) => setBoardInfoRequest(state, request)); refreshAll(context); },
+    setSerialPort: (port) => { update((state) => setSerialPort(state, port)); refreshAll(context); },
+    setAutoConnect: (autoConnect) => { update((state) => setAutoConnect(state, autoConnect)); refreshAll(context); },
+    setPortPresent: (present) => update((state) => setPortPresent(state, present)),
+    setMrbc: (mrbc, directory) => update((state) => setMrbc(state, mrbc, directory)),
+    beginAction: () => { update(beginAction); refreshAll(context); },
+    endAction: () => { update(endAction); refreshAll(context); },
+    writeProjectConfig: (config) => { writeProjectConfig(context, config); refreshAll(context); },
+    writeDeviceConfig: (config) => { writeDeviceConfig(context, config); refreshAll(context); }
+  };
+  return context;
+}
+
+/* --- mrbwriteプロトコル --- */
+
+const encoder = new TextEncoder();
+const decoder = new TextDecoder();
+
+export const sendText = (context: Context, text: string) => write(context, encoder.encode(text));
+
+/**
+ * 受信バイトを復号し、行分割・モード検出・応答解決を行う。
+ *
+ * コマンドモードのプロンプトは改行なしで届くため、未完の行でもモード検出は行う。
+ */
+export function feed(context: Context, bytes: Uint8Array) {
+  const text = decoder.decode(bytes, { stream: true });
+  if (text) context.output.append(text);
+  const lines = (context.get().pending + text).split('\r\n');
+  const pending = lines.pop() ?? '';
+  context.setPending(pending);
+  for (const line of lines) handleLine(context, line, false);
+  if (pending) handleLine(context, pending, true);
+}
+
+export const setPending = (state: State, pending: string): State => ({ ...state, pending });
+
+export function handleLine(context: Context, line: string, isPartial: boolean) {
+  checkCommandModePatterns(context, line);
+  if (isPartial) return;
+  const { responseResolve } = context.get();
+  if (responseResolve
+      && (line.startsWith('+OK') || line.startsWith('-ERR') || line.startsWith('+DONE'))) {
+    context.clearResponse();
+    responseResolve(line);
+  }
+}
+
+/** 受信テキストからコマンドモードの開始・終了を検出する。 */
+export function checkCommandModePatterns(context: Context, text: string) {
+  const { commandMode, lastCommand } = context.get();
+  if (!commandMode && text.includes('+OK mruby/c')) {
+    context.enterCommandMode();
+    logInfo(context, 'Command mode entered.');
+  } else if (commandMode && lastCommand === 'execute'
+      && text.startsWith('+OK') && !text.includes('+OK mruby/c')) {
+    context.exitCommandMode();
+    logInfo(context, 'Command mode exited.');
+  }
+}
+
+export const enterCommandMode = (state: State): State => ({ ...state, commandMode: true });
+export const exitCommandMode = (state: State): State => ({ ...state, commandMode: false, lastCommand: null });
+/** executeの応答でコマンドモードを抜けるよう記録する。 */
+export const beginExecute = (state: State): State => ({ ...state, lastCommand: 'execute' });
+export const expectResponse = (state: State, resolve: (line: string | null) => void): State => ({ ...state, responseResolve: resolve });
+export const clearResponse = (state: State): State => ({ ...state, responseResolve: null });
+export const clearProtocol = (state: State): State =>
+  ({ ...state, pending: '', commandMode: false, lastCommand: null, responseResolve: null, boardInfo: null, boardInfoRequest: null });
+
+/** プロトコル状態を初期化する。待機中の応答はnullで解決する。 */
+export function resetProtocol(context: Context) {
+  const { responseResolve } = context.get();
+  context.clearProtocol();
+  responseResolve?.(null);
+}
+
+/**
+ * ボードからの応答行を待つ。
+ *
+ * @return タイムアウトした場合はnull。
+ */
+export function waitForResponse(context: Context, timeout = 5000): Promise<string | null> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      context.clearResponse();
+      resolve(null);
+    }, timeout);
+    context.expectResponse((line) => { clearTimeout(timer); resolve(line); });
+  });
+}
+
+export async function sendCommand(context: Context, command: string, { ignoreResponse = false } = {}): Promise<string | null> {
+  logInfo(context, `> ${command}`);
+  if (ignoreResponse) {
+    await sendText(context, command + '\r\n');
+    return null;
+  }
+  const response = waitForResponse(context);
+  await sendText(context, command + '\r\n');
+  return response;
+}
+
+/**
+ * コマンドモードへ遷移させる。
+ *
+ * デバイスはCR+LFの受信でコマンドモードに入り、+OK mruby/cを返す。
+ *
+ * @return コマンドモードへ遷移できたかどうか。
+ */
+export async function ensureCommandMode(context: Context, retries = 30): Promise<boolean> {
+  if (context.get().commandMode) return true;
+  for (let attempt = 0; attempt < retries; attempt++) {
+    logInfo(context, `Entering command mode... (${attempt + 1}/${retries})`);
+    try {
+      await sendText(context, '\r\n');
+    } catch (error) {
+      logError(context, `Send error: ${(error as Error).message}`);
+      return false;
+    }
+    await sleep(1000);
+    if (context.get().commandMode) return true;
+  }
+  logError(context, `Command mode transition timed out (${retries}s).`);
+  return false;
+}
+
+export function parseBoardInfo(response: string | null): BoardInfo {
+  const fields = response?.trim().split(/\s+/) ?? [];
+  if (fields[0] !== '+OK' || fields[1] !== 'mruby/c') {
+    return { mrubyc: null, rite: null, error: response === null ? 'versionコマンドの応答がありません。' : `versionコマンドの応答を読み取れません: ${response}` };
+  }
+  return {
+    mrubyc: /^v\d+(?:\.\d+)*$/.test(fields[2] ?? '') ? fields[2] : null,
+    rite: /^RITE\d{4}$/.test(fields[3] ?? '') ? fields[3] : null,
+    error: null
+  };
+}
+
+export const setBoardInfo = (state: State, boardInfo: BoardInfo): State => ({ ...state, boardInfo });
+export const setBoardInfoRequest = (state: State, boardInfoRequest: Promise<void> | null): State => ({ ...state, boardInfoRequest });
+
+export async function readBoardInfo(context: Context): Promise<void> {
+  const { serialPort, commandMode, boardInfo, boardInfoRequest } = context.get();
+  if (!serialPort || !commandMode) return;
+  if (boardInfoRequest) return boardInfoRequest;
+  if (boardInfo) return;
+
+  const request = Promise.resolve().then(async () => {
+    if (context.get().serialPort !== serialPort || context.get().boardInfoRequest !== request) return;
+    let info: BoardInfo;
+    try {
+      context.setPending('');
+      info = parseBoardInfo(await sendCommand(context, 'version'));
+    } catch (error) {
+      if (context.get().boardInfoRequest === request) {
+        const { responseResolve } = context.get();
+        context.clearResponse();
+        responseResolve?.(null);
+      }
+      info = { mrubyc: null, rite: null, error: `versionコマンドの送信に失敗しました: ${(error as Error).message}` };
+    }
+    if (context.get().serialPort === serialPort && context.get().boardInfoRequest === request) {
+      context.setBoardInfo(info);
+    }
+  });
+  context.setBoardInfoRequest(request);
+  try {
+    await request;
+  } finally {
+    if (context.get().boardInfoRequest === request) context.setBoardInfoRequest(null);
+  }
+}
+
+/** writeコマンドに付けるCRC-16を計算する。 */
+export function mrbwriteCrc16(data: Uint8Array): number {
+  let crc = 0x0000;
+  for (let byteIndex = 0; byteIndex < data.length; byteIndex++) {
+    crc ^= data[byteIndex];
+    for (let bitIndex = 0; bitIndex < 8; bitIndex++) {
+      crc = (crc & 0x0001) ? ((crc >> 1) ^ 0x8408) : (crc >> 1);
+    }
+  }
+  return (~crc) & 0xffff;
+}
+
+/**
+ * バイトコードをボードへ書き込む。
+ *
+ * mrbwriteの手順はclear → (コマンドN [CRC] → バイナリ → +DONE) × n。
+ * 受信内容の検証はファーム側に任せ、CRCを渡すだけにとどめる。
+ *
+ * @return 書き込めたかどうか。
+ */
+export async function writeBytecodes(context: Context, { libraries, tasks }: Bytecodes): Promise<boolean> {
+  if (!await ensureCommandMode(context)) return false;
+  if (tasks.length === 0) return false;
+
+  const clearResponse = await sendCommand(context, 'clear');
+  if (!clearResponse?.startsWith('+OK')) {
+    logError(context, `clear failed: ${clearResponse}`);
+    return false;
+  }
+
+  const entries = [
+    ...libraries.map((bytecode) => ({ command: 'write_lib', bytecode })),
+    ...tasks.map((bytecode) => ({ command: 'write', bytecode }))
+  ];
+  const { autoVerify } = getSettings(context);
+  for (const { command, bytecode } of entries) {
+    const crc = autoVerify ? ` ${mrbwriteCrc16(bytecode).toString(16).padStart(4, '0')}` : '';
+    const writeResponse = await sendCommand(context, `${command} ${bytecode.length}${crc}`);
+    if (!writeResponse?.startsWith('+OK Write bytecode')) {
+      logError(context, `${command} command failed: ${writeResponse}`);
+      return false;
+    }
+    logInfo(context, `Sending bytecode (${bytecode.length} bytes)...`);
+    const doneResponse = waitForResponse(context, 10000);
+    await write(context, bytecode);
+    const done = await doneResponse;
+    if (done?.startsWith('+DONE')) {
+      logInfo(context, 'Write completed.');
+    } else if (done?.startsWith('-ERR')) {
+      logError(context, `Write failed: ${done}`);
+      return false;
+    } else {
+      logError(context, `Write response timeout or unexpected: ${done}`);
+      return false;
+    }
+  }
+  return true;
+}
+
+/** ボード上のプログラムを実行する。 */
+export async function execute(context: Context) {
+  if (!await ensureCommandMode(context)) return;
+  context.beginExecute();
+  await sendCommand(context, 'execute', { ignoreResponse: true });
+}
+
+/* --- シリアル通信 --- */
+
+export const connected = (context: Context) => context.get().serialPort !== null;
+
+export const setSerialPort = (state: State, serialPort: SerialPort | null): State =>
+  ({ ...state, serialPort, boardInfo: null, boardInfoRequest: null });
+
+export function connect(context: Context, portPath: string, baudRate: number): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const port = new context.SerialPort({ path: portPath, baudRate }, (error) => {
+      if (error) return reject(error);
+      port.on('data', (buffer: Buffer) => feed(context, new Uint8Array(buffer)));
+      port.on('close', () => onClose(context));
+      port.on('error', () => {});
+      port.set({ brk: false, dtr: true, rts: true }, (error) => {
+        if (error) return port.close(() => reject(error));
+        context.setSerialPort(port);
+        resolve();
+      });
+    });
+  });
+}
+
+export function onClose(context: Context) {
+  if (!connected(context)) return;
+  context.setSerialPort(null);
+  resetProtocol(context);
+  logInfo(context, 'Disconnected.');
+}
+
+export function disconnect(context: Context): Promise<void> {
+  return new Promise((resolve) => {
+    const port = context.get().serialPort;
+    if (!port) return resolve();
+    context.setSerialPort(null);
+    port.close(() => { resetProtocol(context); resolve(); });
+  });
+}
+
+export function write(context: Context, bytes: Uint8Array): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const port = context.get().serialPort;
+    if (!port) return reject(new Error('Not connected'));
+    port.write(Buffer.from(bytes), (error) => (error ? reject(error) : resolve()));
+  });
+}
+
+/** デバイスをソフトリセットする。 */
+export function sendBreak(context: Context): Promise<void> {
+  return new Promise((resolve) => {
+    const port = context.get().serialPort;
+    if (!port) return resolve();
+    port.set({ brk: true, dtr: true, rts: true }, () => {
+      setTimeout(() => port.set({ brk: false, dtr: true, rts: true }, () => resolve()), 100);
+    });
+  });
+}
+
+/* --- mrbcコンパイラ --- */
+
+/**
+ * mrbcのEmscriptenモジュールを読み込む。
+ *
+ * ディレクトリが変われば読み直し、mrubyのバージョン切り替えに追従する。
+ */
+export async function loadMrbc(context: Context, directory: string): Promise<MrbcModule> {
+  const { mrbc, mrbcDirectory } = context.get();
+  if (mrbc && mrbcDirectory === directory) return mrbc;
+  const factory = require(path.join(directory, 'mrbc.js')) as MrbcFactory;
+  const module = await factory({
+    noInitialRun: true,
+    print: (text: string) => context.output.append(text),
+    printErr: (text: string) => context.output.append(`[stderr] ${text}`)
+  });
+  context.setMrbc(module, directory);
+  return module;
+}
+
+export const setMrbc = (state: State, mrbc: MrbcModule, mrbcDirectory: string): State => ({ ...state, mrbc, mrbcDirectory });
+
+export async function compile(context: Context, directory: string, source: string): Promise<Uint8Array | null> {
+  const module = await loadMrbc(context, directory);
+  if (!source.trim()) {
+    logError(context, 'Source code is empty.');
+    return null;
+  }
+  module.FS.writeFile('/input.rb', source);
+  try { module.FS.unlink('/output.mrb'); } catch { /* 初回は存在しない。 */ }
+  try {
+    const exitCode = module.callMain(['-o', '/output.mrb', '/input.rb']);
+    if (exitCode !== 0) {
+      logError(context, `Compile failed (exit code ${exitCode}).`);
+      return null;
+    }
+    return new Uint8Array(module.FS.readFile('/output.mrb'));
+  } catch (error) {
+    logError(context, `Compile error: ${(error as Error).message}`);
+    return null;
+  }
+}
+
+/* --- 設定の保存先 --- */
+
+export const readDeviceConfig = (context: Context): DeviceConfig =>
+  context.storage.get<DeviceConfig>('kaniburner.device') ?? {};
+
+export const writeDeviceConfig = (context: Context, config: DeviceConfig) =>
+  context.storage.update('kaniburner.device', config);
+
+export function projectConfigPath(context: Context): string | null {
+  const root = workspaceRoot(context);
+  return root ? path.join(root, PROJECT_CONFIG_FILENAME) : null;
+}
+
+/**
+ * プロジェクト設定を読む。
+ *
+ * @return ワークスペースを開いていない、またはファイルが無い場合は空。
+ */
+export function readProjectConfig(context: Context): ProjectConfig {
+  const filepath = projectConfigPath(context);
+  if (!filepath || !fs.existsSync(filepath)) return {};
+  try {
+    return JSON.parse(fs.readFileSync(filepath, 'utf8')) as ProjectConfig;
+  } catch (error) {
+    logError(context, `Failed to read ${PROJECT_CONFIG_FILENAME}: ${(error as Error).message}`);
+    return {};
+  }
+}
+
+export function writeProjectConfig(context: Context, config: ProjectConfig) {
+  const filepath = projectConfigPath(context);
+  if (!filepath) {
+    context.vscode.window.showWarningMessage('Kaniburner: プロジェクト設定を保存するにはフォルダを開いてください。');
+    return;
+  }
+  fs.mkdirSync(path.dirname(filepath), { recursive: true });
+  fs.writeFileSync(filepath, JSON.stringify(config, null, 2) + '\n');
+}
+
+/** 欠落キーを既定値で補った設定を返す。 */
+export function getSettings(context: Context): Settings {
+  const device = readDeviceConfig(context);
+  const project = readProjectConfig(context);
+  return {
+    version: project.compiler?.version ?? DEFAULT_VERSION,
+    autoDetect: device.autoDetect ?? true,
+    port: device.port ?? null,
+    baud: device.baud ?? DEFAULT_BAUD,
+    autoConnect: context.get().autoConnect,
+    autoVerify: device.autoVerify ?? true,
+    libraries: project.libraries ?? [],
+    tasks: project.tasks ?? []
+  };
+}
+
+export function updateCompiler(context: Context, patch: NonNullable<ProjectConfig['compiler']>) {
+  const config = readProjectConfig(context);
+  config.compiler = { ...config.compiler, ...patch };
+  context.writeProjectConfig(config);
+}
+
+export function updateDevice(context: Context, patch: DeviceConfig) {
+  context.writeDeviceConfig({ ...readDeviceConfig(context), ...patch });
+}
+
+export function addProjectEntries(context: Context, key: ProjectKey, filenames: string[]) {
+  const config = readProjectConfig(context);
+  config[key] = [...(config[key] ?? []), ...filenames.map((filename) => ({ filename }))];
+  context.writeProjectConfig(config);
+}
+
+export function removeProjectEntry(context: Context, key: ProjectKey, index: number) {
+  const config = readProjectConfig(context);
+  const entries = config[key];
+  if (!entries?.[index]) return;
+  entries.splice(index, 1);
+  context.writeProjectConfig(config);
+}
+
+/** エントリを入れ替えて書き込み順を変える。 */
+export function moveProjectEntry(context: Context, key: ProjectKey, index: number, delta: number) {
+  const config = readProjectConfig(context);
+  const entries = config[key];
+  const destination = index + delta;
+  if (!entries?.[index] || destination < 0 || destination >= entries.length) return;
+  [entries[index], entries[destination]] = [entries[destination], entries[index]];
+  context.writeProjectConfig(config);
+}
+
+/* --- コンパイラの解決 --- */
+
+export function resolveCompilerVersion(context: Context): VersionSelection {
+  const { version, autoDetect } = getSettings(context);
+  if (!autoDetect) return { version, warning: null };
+  if (!connected(context)) return { version, warning: 'デバイスが接続されていません。' };
+  const { boardInfo } = context.get();
+  if (!boardInfo) return { version, warning: 'ボードのバージョン情報を取得していません。' };
+  if (boardInfo.error) return { version, warning: boardInfo.error };
+  if (!boardInfo.rite) return { version, warning: '対応するRITE形式を取得できません。' };
+  const detected = RITE_COMPILERS[boardInfo.rite];
+  return detected
+    ? { version: detected, warning: null }
+    : { version, warning: `${boardInfo.rite}に対応する同梱コンパイラがありません。` };
+}
+
+/**
+ * 設定中のmrubyバージョンに対応するコンパイラのディレクトリを返す。
+ *
+ * @return 同梱されていないバージョンが設定されている場合はnull。
+ */
+export function compilerDirectory(context: Context): string | null {
+  const { version } = resolveCompilerVersion(context);
+  return AVAILABLE_VERSIONS.includes(version)
+    ? path.join(context.extensionPath, 'media', `mruby-${version}`)
+    : null;
+}
+
+/* --- ソース解決 --- */
+
+export function workspaceRoot(context: Context): string | null {
+  return context.vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? null;
+}
+
+/**
+ * ワークスペース内のファイルパスを絶対パスに変換する。
+ *
+ * @return ワークスペースを開いていない場合はnull。
+ */
+export function toAbsoluteFilepath(context: Context, filename: string): string | null {
+  if (path.isAbsolute(filename)) return filename;
+  const root = workspaceRoot(context);
+  return root ? path.join(root, filename) : null;
+}
+
+/**
+ * 直近の.rbドキュメントを記憶する。
+ *
+ * パネル操作でフォーカスが外れても、コンパイル対象を解決できるようにする。
+ */
+export const rememberEditor = (state: State, editor: vscode.TextEditor | undefined): State =>
+  editor?.document.fileName.endsWith('.rb') ? { ...state, lastRubyDocument: editor.document } : state;
+
+export function activeRubyDocument(context: Context): vscode.TextDocument | null {
+  const active = context.vscode.window.activeTextEditor;
+  if (active?.document.fileName.endsWith('.rb')) return active.document;
+  const { lastRubyDocument } = context.get();
+  if (lastRubyDocument && !lastRubyDocument.isClosed) return lastRubyDocument;
+  const visible = context.vscode.window.visibleTextEditors.find((editor) => editor.document.fileName.endsWith('.rb'));
+  return visible?.document ?? null;
+}
+
+export function readSources(context: Context, entries: Entry[], kindLabel: string): Source[] | null {
+  const sources: Source[] = [];
+  for (const { filename } of entries) {
+    const filepath = toAbsoluteFilepath(context, filename);
+    try {
+      if (!filepath) throw new Error('unresolved');
+      sources.push({ filename, source: fs.readFileSync(filepath, 'utf8') });
+    } catch {
+      context.vscode.window.showWarningMessage(`Kaniburner: ${kindLabel} のファイルを開けません: ${filename}`);
+      return null;
+    }
+  }
+  return sources;
+}
+
+/**
+ * コンパイル対象のタスクを読む。
+ *
+ * 設定のtasksを優先し、無ければアクティブな.rbを使う。
+ *
+ * @return 読めなかった場合はnull。
+ */
+export function resolveTaskSources(context: Context): Source[] | null {
+  const { tasks } = getSettings(context);
+  if (tasks.length > 0) return readSources(context, tasks, 'tasks');
+  const document = activeRubyDocument(context);
+  if (!document) {
+    context.vscode.window.showWarningMessage('Kaniburner: .rbファイルを開いてください');
+    return null;
+  }
+  return [{ filename: path.basename(document.fileName), source: document.getText() }];
+}
+
+/**
+ * ワークスペース配下の.rbファイルのfilenameを返す。
+ *
+ * @return ワークスペース外、または.rb以外の場合はnull。
+ */
+export function toProjectFilename(context: Context, uri: vscode.Uri): string | null {
+  const root = workspaceRoot(context);
+  if (!root || !uri.fsPath.endsWith('.rb')) return null;
+  const filename = path.relative(root, uri.fsPath);
+  if (filename.startsWith('..') || path.isAbsolute(filename)) return null;
+  return filename;
+}
+
+/** ディレクトリ配下の.rbファイルをパス順に返す。 */
+function rubyFilepaths(directory: string): string[] {
+  const filepaths: string[] = [];
+  const entries = fs.readdirSync(directory, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name));
+  for (const entry of entries) {
+    const filepath = path.join(directory, entry.name);
+    if (entry.isDirectory()) filepaths.push(...rubyFilepaths(filepath));
+    else if (entry.name.endsWith('.rb')) filepaths.push(filepath);
+  }
+  return filepaths;
+}
+
+/** ディレクトリのURIを配下の.rbファイルへ展開する。 */
+export function expandDirectories(context: Context, uris: vscode.Uri[]): vscode.Uri[] {
+  const expanded: vscode.Uri[] = [];
+  for (const uri of uris) {
+    if (fs.statSync(uri.fsPath, { throwIfNoEntry: false })?.isDirectory()) {
+      for (const filepath of rubyFilepaths(uri.fsPath)) expanded.push(context.vscode.Uri.file(filepath));
+    } else {
+      expanded.push(uri);
+    }
+  }
+  return expanded;
+}
+
+/** 未登録のfilenameだけを重複なく返す。 */
+export function unregisteredFilenames(context: Context, key: ProjectKey, uris: vscode.Uri[]): string[] {
+  const registered = new Set(getSettings(context)[key].map((entry) => entry.filename));
+  const filenames = new Set<string>();
+  for (const uri of uris) {
+    const filename = toProjectFilename(context, uri);
+    if (filename && !registered.has(filename)) filenames.add(filename);
+  }
+  return [...filenames];
+}
+
+/** 開かれているタブのURIを返す。 */
+export function openTabUris(context: Context): vscode.Uri[] {
+  const uris: vscode.Uri[] = [];
+  for (const group of context.vscode.window.tabGroups.all) {
+    for (const tab of group.tabs) {
+      const uri = (tab.input as { uri?: vscode.Uri } | undefined)?.uri;
+      if (uri) uris.push(uri);
+    }
+  }
+  return uris;
+}
+
+export async function compileSources(context: Context, directory: string, sources: Source[]): Promise<Uint8Array[] | null> {
+  const bytecodes: Uint8Array[] = [];
+  for (const { filename, source } of sources) {
+    const bytecode = await compile(context, directory, source);
+    if (!bytecode) {
+      logError(context, `Compile failed: ${filename}`);
+      return null;
+    }
+    bytecodes.push(bytecode);
+  }
+  return bytecodes;
+}
+
+export async function compileAll(context: Context): Promise<Bytecodes | null> {
+  const { version } = resolveCompilerVersion(context);
+  const directory = compilerDirectory(context);
+  if (!directory) {
+    context.vscode.window.showErrorMessage(`Kaniburner: mruby ${version} が見つかりません。`);
+    return null;
+  }
+  const librarySources = readSources(context, getSettings(context).libraries, 'libraries');
+  if (!librarySources) return null;
+  const taskSources = resolveTaskSources(context);
+  if (!taskSources) return null;
+
+  logInfo(context, `Compiling (mruby ${version})...`);
+  const libraries = await compileSources(context, directory, librarySources);
+  if (!libraries) return null;
+  const tasks = await compileSources(context, directory, taskSources);
+  if (!tasks) return null;
+  const total = [...libraries, ...tasks].reduce((sum, bytecode) => sum + bytecode.length, 0);
+  logInfo(context, `Compile succeeded. (${total} bytes)`);
+  return { libraries, tasks };
+}
+
+export async function compileAndWrite(context: Context) {
+  if (!connected(context)) {
+    await compileAll(context);
+    return;
+  }
+  if (!await ensureReady(context)) return;
+  const port = context.get().serialPort;
+  const compiled = await compileAll(context);
+  if (!compiled || !port || context.get().serialPort !== port) return;
+  await writeBytecodes(context, compiled);
+}
+
+/* --- 接続 --- */
+
+/**
+ * シリアルポートを選択させる。
+ *
+ * 選択された値は設定に保存される。
+ *
+ * @return 選択されなかった場合はnull。
+ */
+export async function pickPort(context: Context): Promise<string | null> {
+  const cached = getSettings(context).port;
+  let ports;
+  try {
+    ports = await context.SerialPort.list();
+  } catch (error) {
+    logError(context, `Failed to list ports: ${(error as Error).message}`);
+    return null;
+  }
+  if (ports.length === 0) {
+    context.vscode.window.showErrorMessage('Kaniburner: No serial ports found.');
+    return null;
+  }
+  const items = ports.map((portInfo) => {
+    const metadata = [
+      portInfo.manufacturer,
+      portInfo.vendorId && `VID:${portInfo.vendorId}`,
+      portInfo.productId && `PID:${portInfo.productId}`
+    ].filter(Boolean).join(' ');
+    return { label: portInfo.path, description: metadata || undefined, picked: portInfo.path === cached };
+  });
+  const picked = await context.vscode.window.showQuickPick(items, {
+    title: 'Kaniburner: Select serial port',
+    placeHolder: cached ? `Last used: ${cached}` : 'Pick a port'
+  });
+  if (!picked) return null;
+  updateDevice(context, { port: picked.label });
+  return picked.label;
+}
+
+/**
+ * 接続されている状態にする。
+ *
+ * 未接続なら設定のポートへ接続し、ポートが未設定なら選択させる。
+ *
+ * @return 接続できたかどうか。
+ */
+export async function ensureConnected(context: Context): Promise<boolean> {
+  if (connected(context)) return true;
+  const { baud } = getSettings(context);
+  const portPath = getSettings(context).port ?? await pickPort(context);
+  if (!portPath) return false;
+  logInfo(context, `Connecting (${baud} baud, ${portPath})...`);
+  try {
+    await connect(context, portPath, baud);
+    logInfo(context, 'Connected.');
+    return true;
+  } catch (error) {
+    logError(context, `Connect failed: ${(error as Error).message}`);
+    return false;
+  }
+}
+
+/**
+ * デバイスをソフトリセットし、コマンドモードへ入り直す。
+ *
+ * コマンドモード中はresetコマンド、実行モード中はBREAK信号を使う。
+ * リセット中はポートが一時的に消えるため、再出現を最大30秒待って再接続する。
+ *
+ * @return コマンドモードへ入れたかどうか。
+ */
+export async function resetAndReconnect(context: Context): Promise<boolean> {
+  if (!connected(context)) return false;
+  const { port, baud } = getSettings(context);
+  if (context.get().commandMode) {
+    await sendCommand(context, 'reset', { ignoreResponse: true });
+  } else {
+    logInfo(context, '> break');
+    await sendBreak(context);
+  }
+  resetProtocol(context);
+  for (let attempt = 0; attempt < 30; attempt++) {
+    await sleep(1000);
+    if (connected(context)) break;
+    try {
+      const ports = await context.SerialPort.list();
+      if (port && ports.some((portInfo) => portInfo.path === port)) {
+        await connect(context, port, baud);
+        logInfo(context, 'Reconnected.');
+        break;
+      }
+    } catch { /* リセット中はポートが消えるため、次の試行へ。 */ }
+  }
+  return connected(context) ? await prepareDevice(context) : false;
+}
+
+export async function prepareDevice(context: Context, retries = 30): Promise<boolean> {
+  if (!await ensureCommandMode(context, retries)) return false;
+  await readBoardInfo(context);
+  return connected(context) && context.get().commandMode;
+}
+
+/**
+ * 接続し、コマンドモードへ入る。
+ *
+ * 直接入れない場合はリセット後に入り直す。
+ *
+ * @return コマンドモードへ入れたかどうか。
+ */
+export async function ensureReady(context: Context): Promise<boolean> {
+  if (!await ensureConnected(context)) return false;
+  if (await prepareDevice(context, 3)) return true;
+  return await resetAndReconnect(context);
+}
+
+/** 自動接続の設定。ポートが未設定なら接続先が定まらないため自動接続はしない。 */
+export function autoConnectEnabled(context: Context): boolean {
+  const { port, autoConnect } = getSettings(context);
+  return port !== null && autoConnect;
+}
+
+export const setAutoConnect = (state: State, autoConnect: boolean): State => ({ ...state, autoConnect, portPresent: false });
+
+/**
+ * 設定のポートを監視し、現れた瞬間に接続する。
+ *
+ * serialportに挿抜の通知は無いため、一覧を定期取得して前回との差を見る。
+ * 前回も見えていたポートには接続しないため、手動で切断した後は挿し直すまで繋ぎ直さない。
+ */
+export async function pollAutoConnect(context: Context) {
+  if (context.get().running > 0 || connected(context) || !autoConnectEnabled(context)) return;
+  const { port, baud } = getSettings(context);
+  let present;
+  try {
+    present = (await context.SerialPort.list()).some((portInfo) => portInfo.path === port);
+  } catch {
+    return;
+  }
+  if (context.get().running > 0 || connected(context) || !autoConnectEnabled(context)) return;
+  const appeared = present && !context.get().portPresent;
+  context.setPortPresent(present);
+  if (!appeared) return;
+  context.beginAction();
+  logInfo(context, `Connecting (${baud} baud, ${port})...`);
+  try {
+    await connect(context, port as string, baud);
+    logInfo(context, 'Auto-connected.');
+    await prepareDevice(context, CONNECT_RETRIES);
+  } catch { /* 挿された直後は開けないことがある。次に挿し直された時へ委ねる。 */ }
+  finally { context.endAction(); }
+}
+
+export const setPortPresent = (state: State, portPresent: boolean): State => ({ ...state, portPresent });
+
+/* --- ビュー --- */
+
+export function createProvider(api: typeof vscode, build: (element?: Item) => Item[]): Provider {
+  const emitter = new api.EventEmitter<void>();
+  return {
+    onDidChangeTreeData: emitter.event,
+    getTreeItem: (item) => item,
+    getChildren: build,
+    refresh: () => emitter.fire()
+  };
+}
+
+/** 値を表示し、行内アクションで変更する設定行を作る。 */
+export function settingItem(context: Context, label: string, value: string, contextValue: string, iconName: string): Item {
+  const item = new context.vscode.TreeItem(label);
+  item.description = value;
+  item.contextValue = contextValue;
+  item.iconPath = new context.vscode.ThemeIcon(iconName);
+  return item;
+}
+
+export function buildDeviceView(context: Context, element?: Item): Item[] {
+  if (element) return [];
+  const settings = getSettings(context);
+  const selected = resolveCompilerVersion(context);
+  const version = settingItem(context, 'mruby', selected.version, 'deviceVersion', 'check');
+  if (!compilerDirectory(context)) {
+    version.description = `${selected.version} (not found)`;
+    version.iconPath = new context.vscode.ThemeIcon('warning', new context.vscode.ThemeColor('errorForeground'));
+  }
+  const autoDetect = checkboxItem(context, 'Auto detect compiler', settings.autoDetect, 'deviceAutoDetect');
+  if (selected.warning) {
+    setItemWarning(context, autoDetect, `${selected.warning}\nmruby ${selected.version}を使用します。`);
+  }
+  return [
+    settingItem(context, 'Port', settings.port ?? '(none)', 'devicePort', 'plug'),
+    boardVersionItem(context),
+    settingItem(context, 'Baud', String(settings.baud), 'deviceBaud', 'pulse'),
+    checkboxItem(context, 'Auto connect', settings.autoConnect, 'deviceAutoConnect'),
+    version,
+    autoDetect,
+    checkboxItem(context, 'Auto verify', settings.autoVerify, 'deviceAutoVerify')
+  ];
+}
+
+export function boardVersionItem(context: Context): Item {
+  const { serialPort, boardInfo, boardInfoRequest } = context.get();
+  const value = !serialPort ? '(not connected)' : boardInfo?.mrubyc ?? (boardInfoRequest ? '(reading)' : '(unknown)');
+  const item = settingItem(context, 'mruby/c VM', value, 'deviceVmVersion', 'circuit-board');
+  if (serialPort) {
+    item.tooltip = `接続先: ${serialPort.path}`;
+    if (!boardInfo?.mrubyc && !boardInfoRequest) {
+      setItemWarning(context, item, `${item.tooltip}\n${boardInfo?.error ?? 'VMのバージョンを取得できません。'}`);
+    }
+  }
+  return item;
+}
+
+export function checkboxItem(context: Context, label: string, checked: boolean, contextValue: string): Item {
+  const item: Item = new context.vscode.TreeItem(label);
+  item.contextValue = contextValue;
+  item.iconPath = new context.vscode.ThemeIcon('sync');
+  item.checkboxState = checked
+    ? context.vscode.TreeItemCheckboxState.Checked
+    : context.vscode.TreeItemCheckboxState.Unchecked;
+  return item;
+}
+
+export function setItemWarning(context: Context, item: Item, message: string) {
+  item.iconPath = new context.vscode.ThemeIcon('warning', new context.vscode.ThemeColor('editorWarning.foreground'));
+  item.tooltip = message;
+  if (typeof item.checkboxState === 'number') item.checkboxState = { state: item.checkboxState, tooltip: message };
+}
+
+export function projectParent(context: Context, label: string, key: ProjectKey, count: number): Item {
+  const item: Item = new context.vscode.TreeItem(label, context.vscode.TreeItemCollapsibleState.Expanded);
+  item.contextValue = `${key}Parent`;
+  item.key = key;
+  item.description = String(count);
+  item.iconPath = new context.vscode.ThemeIcon('folder');
+  return item;
+}
+
+/**
+ * 行の位置を返す。
+ *
+ * contextValueに含めることで、入れ替え先が無い端の行で上下ボタンを出し分ける。
+ */
+export function projectPosition(index: number, length: number): string {
+  if (length === 1) return 'Only';
+  if (index === 0) return 'First';
+  if (index === length - 1) return 'Last';
+  return 'Mid';
+}
+
+export function projectChildren(context: Context, key: ProjectKey, entries: Entry[]): Item[] {
+  return entries.map(({ filename }, index) => {
+    const item: Item = new context.vscode.TreeItem(filename);
+    item.contextValue = `projectFile${projectPosition(index, entries.length)}`;
+    item.iconPath = new context.vscode.ThemeIcon('file');
+    item.key = key;
+    item.index = index;
+    const filepath = toAbsoluteFilepath(context, filename);
+    if (filepath) {
+      item.command = { command: 'vscode.open', title: 'Open', arguments: [context.vscode.Uri.file(filepath)] };
+    }
+    return item;
+  });
+}
+
+export function buildProjectView(context: Context, element?: Item): Item[] {
+  if (!workspaceRoot(context)) return [];
+  const settings = getSettings(context);
+  if (!element) {
+    return [
+      projectParent(context, 'Libraries', 'libraries', settings.libraries.length),
+      projectParent(context, 'Tasks', 'tasks', settings.tasks.length)
+    ];
+  }
+  return element.key ? projectChildren(context, element.key, settings[element.key]) : [];
+}
+
+/* --- コマンド --- */
+
+/**
+ * ツールバーのボタンの可否と、ConnectとDisconnectの出し分けに使う接続状態を更新する。
+ *
+ * デバイスは未接続 / コマンドモード / 実行モードの3状態を取り、実行モードから戻す手段はBreakのみ。
+ * Disconnectは待機中の脱出口のためrunningでは無効化しない。
+ */
+export function refreshButtons(context: Context) {
+  const { commandMode, running } = context.get();
+  const isConnected = connected(context);
+  const ready = isConnected && commandMode;
+  const compilerReady = compilerDirectory(context) !== null;
+  const idle = running === 0;
+  const setContext = (key: string, value: boolean) =>
+    context.vscode.commands.executeCommand('setContext', `kaniburner.${key}`, value);
+  const setEnabled = (name: string, enabled: boolean) => setContext(`can${name}`, enabled);
+  setContext('connected', isConnected);
+  setEnabled('Compile', idle && !isConnected && compilerReady);
+  setEnabled('Connect', idle && !isConnected);
+  setEnabled('Disconnect', isConnected);
+  setEnabled('Write', idle && ready && compilerReady);
+  setEnabled('Execute', idle && ready);
+  setEnabled('Reset', idle && isConnected);
+}
+
+export function refreshAll(context: Context) {
+  context.projectProvider.refresh();
+  context.deviceProvider.refresh();
+  refreshButtons(context);
+}
+
+/** 操作を実行する。実行中はボタンを無効化する。 */
+export async function runAction(context: Context, action: () => Promise<void>) {
+  context.beginAction();
+  context.output.show(true);
+  try {
+    await action();
+  } finally {
+    context.endAction();
+  }
+}
+
+export const beginAction = (state: State): State => ({ ...state, running: state.running + 1 });
+export const endAction = (state: State): State => ({ ...state, running: state.running - 1 });
+
+export async function selectVersion(context: Context) {
+  const picked = await context.vscode.window.showQuickPick(AVAILABLE_VERSIONS, {
+    title: 'Kaniburner: Select mruby version'
+  });
+  if (picked) {
+    updateCompiler(context, { version: picked });
+    updateDevice(context, { autoDetect: false });
+  }
+}
+
+export async function selectBaud(context: Context) {
+  const picked = await context.vscode.window.showQuickPick(['9600', '19200', '115200', 'その他...'], {
+    title: 'Kaniburner: Select baud rate'
+  });
+  if (!picked) return;
+  if (picked !== 'その他...') {
+    updateDevice(context, { baud: parseInt(picked, 10) });
+    return;
+  }
+  const input = await context.vscode.window.showInputBox({
+    title: 'Kaniburner: Baud rate',
+    placeHolder: 'e.g. 57600',
+    validateInput: (value) => (/^[1-9][0-9]*$/.test(value.trim()) ? null : '正の整数を入力してください')
+  });
+  if (input) updateDevice(context, { baud: parseInt(input.trim(), 10) });
+}
+
+/**
+ * プロジェクトへファイルを追加する。
+ *
+ * エクスプローラー・タブのメニューからはURIが渡され、それ以外は開いているタブから選択させる。
+ */
+export async function addProjectFile(context: Context, key: ProjectKey, uris: vscode.Uri[]) {
+  if (uris.length > 0) {
+    const filenames = unregisteredFilenames(context, key, expandDirectories(context, uris));
+    if (filenames.length === 0) {
+      context.vscode.window.showInformationMessage('Kaniburner: 追加できる .rb ファイルがありません。');
+      return;
+    }
+    addProjectEntries(context, key, filenames);
+    return;
+  }
+  const candidates = unregisteredFilenames(context, key, openTabUris(context));
+  if (candidates.length === 0) {
+    context.vscode.window.showInformationMessage('Kaniburner: 追加できる未登録の .rb タブがありません。');
+    return;
+  }
+  const picked = await context.vscode.window.showQuickPick(candidates, {
+    title: key === 'libraries' ? 'Kaniburner: Add library' : 'Kaniburner: Add task'
+  });
+  if (picked) addProjectEntries(context, key, [picked]);
+}
+
+/**
+ * コマンド引数からURIを取り出す。
+ *
+ * エクスプローラーは(uri, 選択中のuri[])、タブはuri、ツリーのボタンはItemを渡す。
+ */
+export function uriArguments(context: Context, target: unknown, targets: unknown): vscode.Uri[] {
+  if (Array.isArray(targets)) return targets.filter((item): item is vscode.Uri => item instanceof context.vscode.Uri);
+  return target instanceof context.vscode.Uri ? [target] : [];
+}
+
+let context: Context;
+
+export function activate(extensionContext: vscode.ExtensionContext) {
+  const api: typeof vscode = require('vscode');
+  const output = api.window.createOutputChannel('Kaniburner');
+  extensionContext.subscriptions.push(output);
+
+  context = buildContext({
+    vscode: api,
+    SerialPort: require('serialport').SerialPort,
+    storage: extensionContext.workspaceState,
+    extensionPath: extensionContext.extensionPath,
+    output
+  });
+
+  context.rememberEditor(api.window.activeTextEditor);
+  extensionContext.subscriptions.push(api.window.onDidChangeActiveTextEditor((editor) => context.rememberEditor(editor)));
+
+  const deviceView = api.window.createTreeView<Item>('kaniburner.device', { treeDataProvider: context.deviceProvider });
+  extensionContext.subscriptions.push(
+    api.window.registerTreeDataProvider('kaniburner.project', context.projectProvider),
+    deviceView,
+    deviceView.onDidChangeCheckboxState(({ items }) => {
+      for (const [item, state] of items) {
+        if (item.contextValue === 'deviceAutoConnect') {
+          context.setAutoConnect(state === api.TreeItemCheckboxState.Checked);
+        } else if (item.contextValue === 'deviceAutoDetect') {
+          updateDevice(context, { autoDetect: state === api.TreeItemCheckboxState.Checked });
+        } else if (item.contextValue === 'deviceAutoVerify') {
+          updateDevice(context, { autoVerify: state === api.TreeItemCheckboxState.Checked });
+        }
+      }
+    })
+  );
+  refreshButtons(context);
+
+  const timer = setInterval(() => pollAutoConnect(context), AUTO_CONNECT_INTERVAL);
+  extensionContext.subscriptions.push({ dispose: () => clearInterval(timer) });
+
+  // 手で編集された場合もビューへ反映する。
+  const refresh = () => refreshAll(context);
+  const watcher = api.workspace.createFileSystemWatcher(`**/${PROJECT_CONFIG_FILENAME}`);
+  extensionContext.subscriptions.push(watcher, watcher.onDidChange(refresh), watcher.onDidCreate(refresh), watcher.onDidDelete(refresh));
+
+  const register = (commandId: string, handler: (...args: any[]) => unknown) =>
+    extensionContext.subscriptions.push(api.commands.registerCommand(commandId, handler));
+
+  register('kaniburner.selectVersion', () => selectVersion(context));
+  register('kaniburner.selectBaud', () => selectBaud(context));
+  register('kaniburner.selectPort', () => pickPort(context));
+  register('kaniburner.addLibrary', (target, targets) => addProjectFile(context, 'libraries', uriArguments(context, target, targets)));
+  register('kaniburner.addTask', (target, targets) => addProjectFile(context, 'tasks', uriArguments(context, target, targets)));
+  register('kaniburner.removeProjectFile', (node: Item) => {
+    if (node?.key !== undefined && node.index !== undefined) {
+      removeProjectEntry(context, node.key, node.index);
+    }
+  });
+  register('kaniburner.moveProjectFileUp', (node: Item) => {
+    if (node?.key !== undefined && node.index !== undefined) {
+      moveProjectEntry(context, node.key, node.index, -1);
+    }
+  });
+  register('kaniburner.moveProjectFileDown', (node: Item) => {
+    if (node?.key !== undefined && node.index !== undefined) {
+      moveProjectEntry(context, node.key, node.index, 1);
+    }
+  });
+
+  register('kaniburner.compile', () => runAction(context, () => compileAndWrite(context)));
+  register('kaniburner.write', () => runAction(context, () => compileAndWrite(context)));
+
+  register('kaniburner.execute', () => runAction(context, async () => {
+    if (!await ensureReady(context)) return;
+    await execute(context);
+  }));
+
+  // ResetとBreakは1枠にまとめる。押した時の動作はresetAndReconnectが分ける。
+  const resetOrBreak = () => runAction(context, async () => {
+    if (!connected(context)) {
+      context.vscode.window.showWarningMessage('Kaniburner: Not connected.');
+      return;
+    }
+    await resetAndReconnect(context);
+  });
+  register('kaniburner.reset', resetOrBreak);
+
+  register('kaniburner.connect', () => runAction(context, async () => {
+    if (connected(context)) {
+      context.vscode.window.showInformationMessage('Kaniburner: Already connected.');
+      return;
+    }
+    if (!await ensureConnected(context)) return;
+    await prepareDevice(context, CONNECT_RETRIES);
+  }));
+
+  register('kaniburner.disconnect', async () => {
+    context.output.show(true);
+    logInfo(context, 'Disconnecting...');
+    await disconnect(context);
+  });
+}
+
+export async function deactivate() {
+  await disconnect(context);
+}
