@@ -1,5 +1,5 @@
 /**
- * Kaniburner VS Code拡張。
+ * kaniburner VS Code拡張。
  * mrbwriteプロトコル、mrbc(WASM)によるコンパイル、シリアル通信、UIを持つ。
  */
 import type * as vscode from 'vscode';
@@ -13,11 +13,27 @@ const RITE_COMPILERS: Record<string, string> = { RITE0300: '3.4.0', RITE0400: '4
 const DEFAULT_VERSION = '4.0.0';
 const DEFAULT_BAUD = 115200;
 const PROJECT_CONFIG_FILENAME = '.vscode/kaniburner.json';
-const CONNECT_RETRIES = 10;
-/** 自動接続のためにポート一覧を見る間隔。 */
-const AUTO_CONNECT_INTERVAL = 1000;
+const CONNECT_TIMEOUT = 60000;
+const OPEN_TIMEOUT = 5000;
+const WRITE_TIMEOUT = 5000;
+const DISCONNECT_WAIT_TIMEOUT = 500;
+const CONNECT_INTERVAL = 1000;
 
 type ProjectKey = 'libraries' | 'tasks';
+type Action = 'connect' | 'restart' | 'write' | 'execute' | 'disconnect';
+type Phase = 'selecting' | 'opening' | 'probing' | 'restarting' | 'waiting' | 'info' | 'compile' | 'writing' | 'execute' | 'closing';
+
+interface Operation {
+  action: Action;
+  phase: Phase;
+  controller: AbortController;
+  disconnected: boolean;
+}
+
+interface Probe {
+  port: SerialPort;
+  operation: Operation | null;
+}
 
 /** filenameはワークスペースルートからの相対パス。 */
 interface Entry {
@@ -95,6 +111,7 @@ export interface Dependencies {
   storage: vscode.Memento;
   extensionPath: string;
   output: vscode.OutputChannel;
+  statusBar: vscode.StatusBarItem;
 }
 
 /** 手続きが書き換える状態。 */
@@ -103,8 +120,11 @@ export interface State {
   /* mrbwriteプロトコル */
   pending: string;
   commandMode: boolean;
+  runMode: boolean;
   lastCommand: string | null;
   responseResolve: ((line: string | null) => void) | null;
+  responseAccept: ((line: string) => boolean) | null;
+  probe: Probe | null;
   boardInfo: BoardInfo | null;
   boardInfoRequest: Promise<void> | null;
   /* シリアル通信 */
@@ -115,8 +135,8 @@ export interface State {
   /* mrbcコンパイラ */
   mrbc: MrbcModule | null;
   mrbcDirectory: string | null;
-  /** 実行中の操作数。コマンドパレットからは同時に走りうるため数える。 */
   running: number;
+  operation: Operation | null;
 }
 
 export interface Context extends Dependencies {
@@ -128,9 +148,13 @@ export interface Context extends Dependencies {
   setPending(pending: string): void;
   enterCommandMode(): void;
   exitCommandMode(): void;
+  enterRunMode(): void;
   beginExecute(): void;
-  expectResponse(resolve: (line: string | null) => void): void;
+  expectResponse(resolve: (line: string | null) => void, accept?: (line: string) => boolean): void;
   clearResponse(): void;
+  setProbe(probe: Probe | null): void;
+  setOperation(operation: Operation | null): void;
+  setPhase(phase: Phase): void;
   clearProtocol(): void;
   setBoardInfo(info: BoardInfo): void;
   setBoardInfoRequest(request: Promise<void> | null): void;
@@ -144,7 +168,15 @@ export interface Context extends Dependencies {
   writeDeviceConfig(config: DeviceConfig): void;
 }
 
-const sleep = (milliseconds: number) => new Promise((resolve) => setTimeout(resolve, milliseconds));
+const sleep = (milliseconds: number, signal?: AbortSignal): Promise<void> => new Promise((resolve) => {
+  const finish = () => { clearTimeout(timer); signal?.removeEventListener('abort', finish); resolve(); };
+  const timer = setTimeout(finish, milliseconds);
+  signal?.addEventListener('abort', finish, { once: true });
+  if (signal?.aborted) finish();
+});
+
+const active = (context: Context, operation: Operation | null) =>
+  context.get().operation === operation && !operation?.controller.signal.aborted;
 
 export const logInfo = (context: Context, message: string) => context.output.appendLine(`[info]  ${message}`);
 export const logError = (context: Context, message: string) => { context.output.appendLine(`[error] ${message}`); context.output.show(true); };
@@ -155,8 +187,11 @@ export function buildContext(dependencies: Dependencies): Context {
     lastRubyDocument: null,
     pending: '',
     commandMode: false,
+    runMode: false,
     lastCommand: null,
     responseResolve: null,
+    responseAccept: null,
+    probe: null,
     boardInfo: null,
     boardInfoRequest: null,
     serialPort: null,
@@ -164,7 +199,8 @@ export function buildContext(dependencies: Dependencies): Context {
     portPresent: false,
     mrbc: null,
     mrbcDirectory: null,
-    running: 0
+    running: 0,
+    operation: null
   };
   const update = (transition: (state: State) => State) => { state = transition(state); };
   const context: Context = {
@@ -172,13 +208,21 @@ export function buildContext(dependencies: Dependencies): Context {
     projectProvider: createProvider(dependencies.vscode, (element) => buildProjectView(context, element)),
     deviceProvider: createProvider(dependencies.vscode, (element) => buildDeviceView(context, element)),
     get: () => state,
-    rememberEditor: (editor) => update((state) => rememberEditor(state, editor)),
+    rememberEditor: (editor) => { update((state) => rememberEditor(state, editor)); refreshButtons(context); },
     setPending: (pending) => update((state) => setPending(state, pending)),
     enterCommandMode: () => { update(enterCommandMode); refreshAll(context); },
     exitCommandMode: () => { update(exitCommandMode); refreshAll(context); },
+    enterRunMode: () => { update(enterRunMode); refreshAll(context); },
     beginExecute: () => update(beginExecute),
-    expectResponse: (resolve) => update((state) => expectResponse(state, resolve)),
+    expectResponse: (resolve, accept) => update((state) => expectResponse(state, resolve, accept)),
     clearResponse: () => update(clearResponse),
+    setProbe: (probe) => update((state) => ({ ...state, probe })),
+    setOperation: (operation) => { update((state) => ({ ...state, operation })); refreshButtons(context); },
+    setPhase: (phase) => {
+      const { operation } = state;
+      if (operation) operation.phase = phase;
+      refreshButtons(context);
+    },
     clearProtocol: () => { update(clearProtocol); refreshAll(context); },
     setBoardInfo: (info) => { update((state) => setBoardInfo(state, info)); refreshAll(context); },
     setBoardInfoRequest: (request) => { update((state) => setBoardInfoRequest(state, request)); refreshAll(context); },
@@ -221,8 +265,9 @@ export const setPending = (state: State, pending: string): State => ({ ...state,
 export function handleLine(context: Context, line: string, isPartial: boolean) {
   checkCommandModePatterns(context, line);
   if (isPartial) return;
-  const { responseResolve } = context.get();
+  const { responseResolve, responseAccept } = context.get();
   if (responseResolve
+      && (!responseAccept || responseAccept(line))
       && (line.startsWith('+OK') || line.startsWith('-ERR') || line.startsWith('+DONE'))) {
     context.clearResponse();
     responseResolve(line);
@@ -231,30 +276,38 @@ export function handleLine(context: Context, line: string, isPartial: boolean) {
 
 /** 受信テキストからコマンドモードの開始・終了を検出する。 */
 export function checkCommandModePatterns(context: Context, text: string) {
-  const { commandMode, lastCommand } = context.get();
-  if (!commandMode && text.includes('+OK mruby/c')) {
+  const { commandMode, probe, operation, serialPort } = context.get();
+  if (/Kani-Board, Please push Enter key to mrbw(?:r)?ite mode/.test(text)) {
+    resetProtocol(context, { preservePending: true });
+  } else if (/Kani-Board, End mrbwrite mode/.test(text)) {
+    resetProtocol(context, { preservePending: true });
+  } else if (/Kani-Board, mruby\/c .* start/.test(text)) {
+    resetProtocol(context, { preservePending: true });
+    context.enterRunMode();
+  } else if (!commandMode && probe && probe.port === serialPort
+      && active(context, probe.operation) && /^\+OK mruby\/c\s*$/.test(text)) {
     context.enterCommandMode();
+    if (operation?.action === 'connect' || operation?.action === 'restart') context.setPhase('info');
     logInfo(context, 'Command mode entered.');
-  } else if (commandMode && lastCommand === 'execute'
-      && text.startsWith('+OK') && !text.includes('+OK mruby/c')) {
-    context.exitCommandMode();
-    logInfo(context, 'Command mode exited.');
   }
 }
 
-export const enterCommandMode = (state: State): State => ({ ...state, commandMode: true });
-export const exitCommandMode = (state: State): State => ({ ...state, commandMode: false, lastCommand: null });
+export const enterCommandMode = (state: State): State => ({ ...state, commandMode: true, runMode: false, lastCommand: null });
+export const exitCommandMode = (state: State): State => ({ ...state, commandMode: false, runMode: false, lastCommand: null });
+export const enterRunMode = (state: State): State => ({ ...state, commandMode: false, runMode: true, lastCommand: null });
 /** executeの応答でコマンドモードを抜けるよう記録する。 */
 export const beginExecute = (state: State): State => ({ ...state, lastCommand: 'execute' });
-export const expectResponse = (state: State, resolve: (line: string | null) => void): State => ({ ...state, responseResolve: resolve });
-export const clearResponse = (state: State): State => ({ ...state, responseResolve: null });
+export const expectResponse = (state: State, resolve: (line: string | null) => void, accept?: (line: string) => boolean): State =>
+  ({ ...state, responseResolve: resolve, responseAccept: accept ?? null });
+export const clearResponse = (state: State): State => ({ ...state, responseResolve: null, responseAccept: null });
 export const clearProtocol = (state: State): State =>
-  ({ ...state, pending: '', commandMode: false, lastCommand: null, responseResolve: null, boardInfo: null, boardInfoRequest: null });
+  ({ ...state, pending: '', commandMode: false, runMode: false, lastCommand: null, responseResolve: null, responseAccept: null, probe: null, boardInfo: null, boardInfoRequest: null });
 
 /** プロトコル状態を初期化する。待機中の応答はnullで解決する。 */
-export function resetProtocol(context: Context) {
-  const { responseResolve } = context.get();
+export function resetProtocol(context: Context, { preservePending = false } = {}) {
+  const { responseResolve, pending } = context.get();
   context.clearProtocol();
+  if (preservePending) context.setPending(pending);
   responseResolve?.(null);
 }
 
@@ -263,13 +316,15 @@ export function resetProtocol(context: Context) {
  *
  * @return タイムアウトした場合はnull。
  */
-export function waitForResponse(context: Context, timeout = 5000): Promise<string | null> {
+export function waitForResponse(context: Context, timeout = 5000, accept?: (line: string) => boolean): Promise<string | null> {
   return new Promise((resolve) => {
-    const timer = setTimeout(() => {
-      context.clearResponse();
-      resolve(null);
-    }, timeout);
-    context.expectResponse((line) => { clearTimeout(timer); resolve(line); });
+    const finish = (line: string | null) => {
+      clearTimeout(timer);
+      if (context.get().responseResolve === finish) context.clearResponse();
+      resolve(line);
+    };
+    const timer = setTimeout(() => finish(null), timeout);
+    context.expectResponse(finish, accept);
   });
 }
 
@@ -279,8 +334,18 @@ export async function sendCommand(context: Context, command: string, { ignoreRes
     await sendText(context, command + '\r\n');
     return null;
   }
-  const response = waitForResponse(context);
-  await sendText(context, command + '\r\n');
+  const accept = (line: string) => line.startsWith('-ERR') || (command === 'version'
+    ? /^\+OK mruby\/c\s+\S+/.test(line)
+    : command.startsWith('write') ? line.startsWith('+OK Write bytecode')
+      : command === 'reset' ? /^\+OK\s*$/.test(line) : /^\+OK(?:\s+Execute)?\s*$/.test(line));
+  const response = waitForResponse(context, 5000, accept);
+  const resolve = context.get().responseResolve;
+  try {
+    await sendText(context, command + '\r\n');
+  } catch (error) {
+    resolve?.(null);
+    throw error;
+  }
   return response;
 }
 
@@ -291,21 +356,34 @@ export async function sendCommand(context: Context, command: string, { ignoreRes
  *
  * @return コマンドモードへ遷移できたかどうか。
  */
-export async function ensureCommandMode(context: Context, retries = 30): Promise<boolean> {
+export async function ensureCommandMode(context: Context, retries = 30, progress?: string): Promise<boolean> {
   if (context.get().commandMode) return true;
-  for (let attempt = 0; attempt < retries; attempt++) {
-    logInfo(context, `Entering command mode... (${attempt + 1}/${retries})`);
-    try {
+  const { serialPort: port, operation } = context.get();
+  if (!port) return false;
+  const probe = { port, operation };
+  context.setProbe(probe);
+  try {
+    for (let attempt = 0; attempt < retries; attempt++) {
+      if (!active(context, operation) || context.get().serialPort !== port) return false;
+      context.setProbe(probe);
+      logInfo(context, `Entering command mode... (${progress ?? `${attempt + 1}/${retries}`})`);
       await sendText(context, '\r\n');
-    } catch (error) {
-      logError(context, `Send error: ${(error as Error).message}`);
-      return false;
+      await sleep(CONNECT_INTERVAL, operation?.controller.signal);
+      if (!active(context, operation) || context.get().serialPort !== port) return false;
+      if (context.get().commandMode) return true;
     }
-    await sleep(1000);
-    if (context.get().commandMode) return true;
+    if (retries > 1) logError(context, `Command mode transition timed out (${retries}s).`);
+    return false;
+  } catch (error) {
+    const message = (error as Error).message;
+    const retrying = operation?.action === 'connect' || operation?.action === 'restart';
+    if (active(context, operation) && (!retrying || message !== 'Serial write timed out.')) {
+      logError(context, `Send error: ${message}`);
+    }
+    return false;
+  } finally {
+    if (context.get().probe === probe) context.setProbe(null);
   }
-  logError(context, `Command mode transition timed out (${retries}s).`);
-  return false;
 }
 
 export function parseBoardInfo(response: string | null): BoardInfo {
@@ -376,49 +454,81 @@ export function mrbwriteCrc16(data: Uint8Array): number {
  * @return 書き込めたかどうか。
  */
 export async function writeBytecodes(context: Context, { libraries, tasks }: Bytecodes): Promise<boolean> {
-  if (!await ensureCommandMode(context)) return false;
-  if (tasks.length === 0) return false;
-
-  const clearResponse = await sendCommand(context, 'clear');
-  if (!clearResponse?.startsWith('+OK')) {
-    logError(context, `clear failed: ${clearResponse}`);
+  const { serialPort: port, operation } = context.get();
+  const valid = () => active(context, operation) && context.get().serialPort === port;
+  if (!port || !context.get().commandMode || tasks.length === 0) return false;
+  context.setPhase('writing');
+  try {
+    const cleared = await sendCommand(context, 'clear');
+    if (!valid()) return false;
+    if (!cleared?.startsWith('+OK')) {
+      if (cleared === null) resetProtocol(context);
+      logError(context, `clear failed: ${cleared}`);
+      return false;
+    }
+    const entries = [
+      ...libraries.map((bytecode) => ({ command: 'write_lib', bytecode })),
+      ...tasks.map((bytecode) => ({ command: 'write', bytecode }))
+    ];
+    const { autoVerify } = getSettings(context);
+    for (const { command, bytecode } of entries) {
+      if (!valid() || !context.get().commandMode) return false;
+      const crc = autoVerify ? ` ${mrbwriteCrc16(bytecode).toString(16).padStart(4, '0')}` : '';
+      const response = await sendCommand(context, `${command} ${bytecode.length}${crc}`);
+      if (!valid()) return false;
+      if (!response?.startsWith('+OK Write bytecode')) {
+        if (response === null) resetProtocol(context);
+        logError(context, `${command} command failed: ${response}`);
+        return false;
+      }
+      logInfo(context, `Sending bytecode (${bytecode.length} bytes)...`);
+      const doneResponse = waitForResponse(context, 10000, (line) => line.startsWith('+DONE') || line.startsWith('-ERR'));
+      await write(context, bytecode);
+      const done = await doneResponse;
+      if (!valid()) return false;
+      if (done?.startsWith('+DONE')) {
+        logInfo(context, 'Write completed.');
+      } else {
+        if (done === null) resetProtocol(context);
+        logError(context, `Write failed: ${done}`);
+        return false;
+      }
+    }
+    return true;
+  } catch (error) {
+    if (valid()) {
+      resetProtocol(context);
+      logError(context, `Write failed: ${(error as Error).message}`);
+    }
     return false;
   }
-
-  const entries = [
-    ...libraries.map((bytecode) => ({ command: 'write_lib', bytecode })),
-    ...tasks.map((bytecode) => ({ command: 'write', bytecode }))
-  ];
-  const { autoVerify } = getSettings(context);
-  for (const { command, bytecode } of entries) {
-    const crc = autoVerify ? ` ${mrbwriteCrc16(bytecode).toString(16).padStart(4, '0')}` : '';
-    const writeResponse = await sendCommand(context, `${command} ${bytecode.length}${crc}`);
-    if (!writeResponse?.startsWith('+OK Write bytecode')) {
-      logError(context, `${command} command failed: ${writeResponse}`);
-      return false;
-    }
-    logInfo(context, `Sending bytecode (${bytecode.length} bytes)...`);
-    const doneResponse = waitForResponse(context, 10000);
-    await write(context, bytecode);
-    const done = await doneResponse;
-    if (done?.startsWith('+DONE')) {
-      logInfo(context, 'Write completed.');
-    } else if (done?.startsWith('-ERR')) {
-      logError(context, `Write failed: ${done}`);
-      return false;
-    } else {
-      logError(context, `Write response timeout or unexpected: ${done}`);
-      return false;
-    }
-  }
-  return true;
 }
 
 /** ボード上のプログラムを実行する。 */
 export async function execute(context: Context) {
-  if (!await ensureCommandMode(context)) return;
+  const { serialPort: port, operation } = context.get();
+  if (!port || !context.get().commandMode) return;
+  context.setPhase('execute');
   context.beginExecute();
-  await sendCommand(context, 'execute', { ignoreResponse: true });
+  try {
+    const response = await sendCommand(context, 'execute');
+    if (!active(context, operation) || context.get().serialPort !== port) return;
+    if (response?.startsWith('-ERR')) {
+      context.enterCommandMode();
+      logError(context, `Execute failed: ${response}`);
+    } else {
+      const runMode = context.get().runMode || (response !== null && context.get().lastCommand === 'execute');
+      resetProtocol(context, { preservePending: true });
+      if (runMode) context.enterRunMode();
+      if (response === null && !runMode) logError(context, 'Execute response timed out.');
+      else logInfo(context, 'Command mode exited.');
+    }
+  } catch (error) {
+    if (active(context, operation) && context.get().serialPort === port) {
+      resetProtocol(context);
+      logError(context, `Execute failed: ${(error as Error).message}`);
+    }
+  }
 }
 
 /* --- シリアル通信 --- */
@@ -426,57 +536,145 @@ export async function execute(context: Context) {
 export const connected = (context: Context) => context.get().serialPort !== null;
 
 export const setSerialPort = (state: State, serialPort: SerialPort | null): State =>
-  ({ ...state, serialPort, boardInfo: null, boardInfoRequest: null });
+  ({ ...state, serialPort, runMode: false, boardInfo: null, boardInfoRequest: null });
 
 export function connect(context: Context, portPath: string, baudRate: number): Promise<void> {
+  const { operation } = context.get();
   return new Promise((resolve, reject) => {
+    let finished = false;
+    let opened = false;
+    const signal = operation?.controller.signal;
+    const finish = (error?: Error) => {
+      if (finished) return;
+      finished = true;
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', abort);
+      if (error) reject(error); else resolve();
+    };
+    const abort = () => {
+      finish(new Error('Connection cancelled.'));
+      if (opened) port.close(() => {});
+    };
+    const timer = setTimeout(() => {
+      finish(new Error('Serial port open timed out.'));
+      if (opened) port.close(() => {});
+    }, OPEN_TIMEOUT);
     const port = new context.SerialPort({ path: portPath, baudRate }, (error) => {
-      if (error) return reject(error);
-      port.on('data', (buffer: Buffer) => feed(context, new Uint8Array(buffer)));
-      port.on('close', () => onClose(context));
-      port.on('error', () => {});
+      if (error) return finish(error);
+      opened = true;
+      if (finished || !active(context, operation)) {
+        port.close(() => {});
+        return finish(new Error('Connection cancelled.'));
+      }
+      port.on('data', (buffer: Buffer) => {
+        if (context.get().serialPort === port) feed(context, new Uint8Array(buffer));
+      });
+      port.on('close', () => {
+        opened = false;
+        if (!finished) finish(new Error('Serial port closed while opening.'));
+        onClose(context, port);
+      });
+      port.on('error', (error) => {
+        if (context.get().serialPort === port && context.get().operation?.action !== 'disconnect') {
+          resetProtocol(context);
+          logError(context, `Serial error: ${error.message}`);
+        }
+      });
       port.set({ brk: false, dtr: true, rts: true }, (error) => {
-        if (error) return port.close(() => reject(error));
+        if (finished) return;
+        if (error) {
+          finish(error);
+          port.close(() => {});
+          return;
+        }
+        if (!active(context, operation)) return abort();
         context.setSerialPort(port);
-        resolve();
+        finish();
       });
     });
+    signal?.addEventListener('abort', abort, { once: true });
+    if (signal?.aborted) abort();
   });
 }
 
-export function onClose(context: Context) {
-  if (!connected(context)) return;
+export function onClose(context: Context, port = context.get().serialPort) {
+  if (!port || context.get().serialPort !== port) return;
+  const { operation } = context.get();
   context.setSerialPort(null);
   resetProtocol(context);
-  logInfo(context, 'Disconnected.');
+  if ((operation?.action === 'connect' || operation?.action === 'restart') && operation.phase !== 'info') {
+    operation.disconnected = true;
+    context.setPhase('waiting');
+  } else if (operation?.action !== 'disconnect') {
+    stopOperation(context);
+  }
+  if (operation?.action !== 'disconnect') logInfo(context, 'Disconnected.');
 }
 
-export function disconnect(context: Context): Promise<void> {
-  return new Promise((resolve) => {
-    const port = context.get().serialPort;
-    if (!port) return resolve();
-    context.setSerialPort(null);
-    port.close(() => { resetProtocol(context); resolve(); });
-  });
+export async function disconnect(context: Context): Promise<void> {
+  if (context.get().operation?.action === 'disconnect') return;
+  stopOperation(context);
+  context.setAutoConnect(false);
+  const port = context.get().serialPort;
+  if (!port) return;
+  await runAction(context, async () => {
+    context.setPhase('closing');
+    resetProtocol(context);
+    await new Promise<void>((resolve) => {
+      let finished = false;
+      const finish = () => {
+        if (finished) return;
+        finished = true;
+        clearTimeout(timer);
+        resolve();
+      };
+      const timer = setTimeout(finish, DISCONNECT_WAIT_TIMEOUT);
+      port.write(Buffer.alloc(0), (error) => {
+        if (finished) return;
+        if (error) finish(); else port.drain(finish);
+      });
+    });
+    if (context.get().serialPort !== port) return;
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('Serial port close timed out.')), 5000);
+      port.close((error) => {
+        clearTimeout(timer);
+        if (context.get().serialPort === port && (!error || !port.isOpen)) context.setSerialPort(null);
+        if (error) reject(error); else resolve();
+      });
+    });
+  }, 'disconnect');
 }
 
 export function write(context: Context, bytes: Uint8Array): Promise<void> {
   return new Promise((resolve, reject) => {
     const port = context.get().serialPort;
     if (!port) return reject(new Error('Not connected'));
-    port.write(Buffer.from(bytes), (error) => (error ? reject(error) : resolve()));
+    const timer = setTimeout(() => reject(new Error('Serial write timed out.')), WRITE_TIMEOUT);
+    port.write(Buffer.from(bytes), (error) => {
+      clearTimeout(timer);
+      if (error) reject(error); else resolve();
+    });
   });
 }
 
 /** デバイスをソフトリセットする。 */
-export function sendBreak(context: Context): Promise<void> {
-  return new Promise((resolve) => {
-    const port = context.get().serialPort;
-    if (!port) return resolve();
-    port.set({ brk: true, dtr: true, rts: true }, () => {
-      setTimeout(() => port.set({ brk: false, dtr: true, rts: true }, () => resolve()), 100);
+export async function sendBreak(context: Context): Promise<void> {
+  const port = context.get().serialPort;
+  if (!port) return;
+  const set = (brk: boolean) => new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('Break signal timed out.')), 5000);
+    port.set({ brk, dtr: true, rts: true }, (error) => {
+      clearTimeout(timer);
+      if (error) reject(error); else resolve();
     });
   });
+  try {
+    await set(true);
+    await sleep(100);
+  } finally {
+    if (context.get().serialPort === port) await set(false);
+  }
 }
 
 /* --- mrbcコンパイラ --- */
@@ -554,7 +752,7 @@ export function readProjectConfig(context: Context): ProjectConfig {
 export function writeProjectConfig(context: Context, config: ProjectConfig) {
   const filepath = projectConfigPath(context);
   if (!filepath) {
-    context.vscode.window.showWarningMessage('Kaniburner: プロジェクト設定を保存するにはフォルダを開いてください。');
+    context.vscode.window.showWarningMessage('kaniburner: プロジェクト設定を保存するにはフォルダを開いてください。');
     return;
   }
   fs.mkdirSync(path.dirname(filepath), { recursive: true });
@@ -681,7 +879,7 @@ export function readSources(context: Context, entries: Entry[], kindLabel: strin
       if (!filepath) throw new Error('unresolved');
       sources.push({ filename, source: fs.readFileSync(filepath, 'utf8') });
     } catch {
-      context.vscode.window.showWarningMessage(`Kaniburner: ${kindLabel} のファイルを開けません: ${filename}`);
+      context.vscode.window.showWarningMessage(`kaniburner: ${kindLabel} のファイルを開けません: ${filename}`);
       return null;
     }
   }
@@ -700,7 +898,7 @@ export function resolveTaskSources(context: Context): Source[] | null {
   if (tasks.length > 0) return readSources(context, tasks, 'tasks');
   const document = activeRubyDocument(context);
   if (!document) {
-    context.vscode.window.showWarningMessage('Kaniburner: .rbファイルを開いてください');
+    context.vscode.window.showWarningMessage('kaniburner: .rbファイルを開いてください');
     return null;
   }
   return [{ filename: path.basename(document.fileName), source: document.getText() }];
@@ -784,7 +982,7 @@ export async function compileAll(context: Context): Promise<Bytecodes | null> {
   const { version } = resolveCompilerVersion(context);
   const directory = compilerDirectory(context);
   if (!directory) {
-    context.vscode.window.showErrorMessage(`Kaniburner: mruby ${version} が見つかりません。`);
+    context.vscode.window.showErrorMessage(`kaniburner: mruby ${version} が見つかりません。`);
     return null;
   }
   const librarySources = readSources(context, getSettings(context).libraries, 'libraries');
@@ -803,14 +1001,11 @@ export async function compileAll(context: Context): Promise<Bytecodes | null> {
 }
 
 export async function compileAndWrite(context: Context) {
-  if (!connected(context)) {
-    await compileAll(context);
-    return;
-  }
   if (!await ensureReady(context)) return;
-  const port = context.get().serialPort;
+  const { serialPort: port, operation } = context.get();
+  context.setPhase('compile');
   const compiled = await compileAll(context);
-  if (!compiled || !port || context.get().serialPort !== port) return;
+  if (!compiled || !port || !active(context, operation) || context.get().serialPort !== port) return;
   await writeBytecodes(context, compiled);
 }
 
@@ -833,7 +1028,7 @@ export async function pickPort(context: Context): Promise<string | null> {
     return null;
   }
   if (ports.length === 0) {
-    context.vscode.window.showErrorMessage('Kaniburner: No serial ports found.');
+    context.vscode.window.showErrorMessage('kaniburner: No serial ports found.');
     return null;
   }
   const items = ports.map((portInfo) => {
@@ -845,7 +1040,7 @@ export async function pickPort(context: Context): Promise<string | null> {
     return { label: portInfo.path, description: metadata || undefined, picked: portInfo.path === cached };
   });
   const picked = await context.vscode.window.showQuickPick(items, {
-    title: 'Kaniburner: Select serial port',
+    title: 'kaniburner: Select serial port',
     placeHolder: cached ? `Last used: ${cached}` : 'Pick a port'
   });
   if (!picked) return null;
@@ -860,72 +1055,129 @@ export async function pickPort(context: Context): Promise<string | null> {
  *
  * @return 接続できたかどうか。
  */
-export async function ensureConnected(context: Context): Promise<boolean> {
+export async function ensureConnected(context: Context, quiet = false): Promise<boolean> {
   if (connected(context)) return true;
+  const { operation } = context.get();
   const { baud } = getSettings(context);
   const portPath = getSettings(context).port ?? await pickPort(context);
-  if (!portPath) return false;
+  if (!portPath || !active(context, operation)) return false;
   logInfo(context, `Connecting (${baud} baud, ${portPath})...`);
   try {
     await connect(context, portPath, baud);
-    logInfo(context, 'Connected.');
+    logInfo(context, quiet ? 'Auto-connected.' : 'Connected.');
     return true;
   } catch (error) {
-    logError(context, `Connect failed: ${(error as Error).message}`);
+    if (!quiet) logError(context, `Connect failed: ${(error as Error).message}`);
     return false;
   }
 }
 
-/**
- * デバイスをソフトリセットし、コマンドモードへ入り直す。
- *
- * コマンドモード中はresetコマンド、実行モード中はBREAK信号を使う。
- * リセット中はポートが一時的に消えるため、再出現を最大30秒待って再接続する。
- *
- * @return コマンドモードへ入れたかどうか。
- */
-export async function resetAndReconnect(context: Context): Promise<boolean> {
-  if (!connected(context)) return false;
-  const { port, baud } = getSettings(context);
-  if (context.get().commandMode) {
-    await sendCommand(context, 'reset', { ignoreResponse: true });
-  } else {
-    logInfo(context, '> break');
-    await sendBreak(context);
-  }
+/** 接続し、mrbwriteを確立する。 */
+export async function connectDevice(context: Context, quiet = false): Promise<boolean> {
+  return await runAction(context, async (operation) => {
+    context.setPhase('selecting');
+    const { port, baud } = getSettings(context);
+    const portPath = port ?? await pickPort(context);
+    if (!portPath || !active(context, operation)) return false;
+    return await establishDevice(context, portPath, baud, quiet);
+  }, 'connect') ?? false;
+}
+
+/** Restart後のmrbwrite確立が済むまで、再接続の要求を保持する。 */
+export async function restartAndReconnect(context: Context): Promise<boolean> {
+  const port = context.get().serialPort;
+  if (!port || !canAction(context, 'Restart')) return false;
+  const commandMode = context.get().commandMode;
+  stopOperation(context);
+  return await runAction(context, () => establishDevice(context, port.path, port.baudRate, false, commandMode), 'restart') ?? false;
+}
+
+async function establishDevice(context: Context, portPath: string, baud: number, quiet = false, restart?: boolean): Promise<boolean> {
+  const { operation } = context.get();
+  if (!operation) return false;
+  const started = Date.now();
+  const progress = () => `${Math.floor((Date.now() - started) / 1000)}/${CONNECT_TIMEOUT / 1000}s`;
+  const timer = setTimeout(() => {
+    if (context.get().operation !== operation || operation.phase === 'info') return;
+    stopOperation(context);
+    if (!quiet) logError(context, `Connection attempt timed out (${CONNECT_TIMEOUT / 1000}s).`);
+  }, CONNECT_TIMEOUT);
   resetProtocol(context);
-  for (let attempt = 0; attempt < 30; attempt++) {
-    await sleep(1000);
-    if (connected(context)) break;
-    try {
-      const ports = await context.SerialPort.list();
-      if (port && ports.some((portInfo) => portInfo.path === port)) {
-        await connect(context, port, baud);
-        logInfo(context, 'Reconnected.');
-        break;
+  try {
+    if (restart !== undefined) {
+      context.setPhase('restarting');
+      try {
+        if (restart) {
+          const response = await sendCommand(context, 'reset');
+          if (!active(context, operation)) return false;
+          if (!operation.disconnected && !response?.startsWith('+OK')) {
+            logError(context, `Restart failed: ${response}`);
+            return false;
+          }
+        } else {
+          logInfo(context, '> break');
+          await sendBreak(context);
+        }
+      } catch (error) {
+        if (!operation.disconnected) throw error;
       }
-    } catch { /* リセット中はポートが消えるため、次の試行へ。 */ }
+      context.setPhase(connected(context) ? 'probing' : 'waiting');
+      await sleep(CONNECT_INTERVAL, operation.controller.signal);
+    }
+    while (active(context, operation)) {
+      const attempt = Date.now();
+      if (!connected(context)) {
+        context.setPhase('waiting');
+        logInfo(context, `Listing ports (${portPath})... (${progress()})`);
+        try {
+          const ports = await context.SerialPort.list();
+          if (!active(context, operation)) break;
+          if (ports.some((info) => info.path === portPath)) {
+            context.setPhase('opening');
+            logInfo(context, `Connecting (${baud} baud, ${portPath})...`);
+            await connect(context, portPath, baud);
+            if (!active(context, operation)) break;
+            logInfo(context, quiet ? 'Auto-connected.' : restart !== undefined ? 'Reconnected.' : 'Connected.');
+          }
+        } catch (error) {
+          if (!quiet && active(context, operation)) logError(context, `Connect failed: ${(error as Error).message}`);
+        }
+      }
+      if (active(context, operation) && connected(context)) {
+        context.setPhase('probing');
+        if (await ensureCommandMode(context, 1, progress()) && active(context, operation) && connected(context)) {
+          clearTimeout(timer);
+          context.setPhase('info');
+          await readBoardInfo(context);
+          return active(context, operation) && connected(context) && context.get().commandMode;
+        }
+      }
+      const delay = CONNECT_INTERVAL - (Date.now() - attempt);
+      if (delay > 0) await sleep(delay, operation.controller.signal);
+    }
+    return false;
+  } catch (error) {
+    if (active(context, operation)) {
+      resetProtocol(context);
+      logError(context, `Connection failed: ${(error as Error).message}`);
+    }
+    return false;
+  } finally {
+    clearTimeout(timer);
   }
-  return connected(context) ? await prepareDevice(context) : false;
 }
 
 export async function prepareDevice(context: Context, retries = 30): Promise<boolean> {
-  if (!await ensureCommandMode(context, retries)) return false;
+  const { operation } = context.get();
+  if (!await ensureCommandMode(context, retries) || !active(context, operation)) return false;
+  context.setPhase('info');
   await readBoardInfo(context);
-  return connected(context) && context.get().commandMode;
+  return active(context, operation) && connected(context) && context.get().commandMode;
 }
 
-/**
- * 接続し、コマンドモードへ入る。
- *
- * 直接入れない場合はリセット後に入り直す。
- *
- * @return コマンドモードへ入れたかどうか。
- */
+/** コマンド受付を確認済みかどうか。 */
 export async function ensureReady(context: Context): Promise<boolean> {
-  if (!await ensureConnected(context)) return false;
-  if (await prepareDevice(context, 3)) return true;
-  return await resetAndReconnect(context);
+  return connected(context) && context.get().commandMode;
 }
 
 /** 自動接続の設定。ポートが未設定なら接続先が定まらないため自動接続はしない。 */
@@ -940,7 +1192,7 @@ export const setAutoConnect = (state: State, autoConnect: boolean): State => ({ 
  * 設定のポートを監視し、現れた瞬間に接続する。
  *
  * serialportに挿抜の通知は無いため、一覧を定期取得して前回との差を見る。
- * 前回も見えていたポートには接続しないため、手動で切断した後は挿し直すまで繋ぎ直さない。
+ * 手動のCancel・DisconnectではAutoConnectを無効にし、終了した要求を再開させない。
  */
 export async function pollAutoConnect(context: Context) {
   if (context.get().running > 0 || connected(context) || !autoConnectEnabled(context)) return;
@@ -952,17 +1204,11 @@ export async function pollAutoConnect(context: Context) {
     return;
   }
   if (context.get().running > 0 || connected(context) || !autoConnectEnabled(context)) return;
+  if (getSettings(context).port !== port || getSettings(context).baud !== baud) return;
   const appeared = present && !context.get().portPresent;
   context.setPortPresent(present);
   if (!appeared) return;
-  context.beginAction();
-  logInfo(context, `Connecting (${baud} baud, ${port})...`);
-  try {
-    await connect(context, port as string, baud);
-    logInfo(context, 'Auto-connected.');
-    await prepareDevice(context, CONNECT_RETRIES);
-  } catch { /* 挿された直後は開けないことがある。次に挿し直された時へ委ねる。 */ }
-  finally { context.endAction(); }
+  await connectDevice(context, true);
 }
 
 export const setPortPresent = (state: State, portPresent: boolean): State => ({ ...state, portPresent });
@@ -1091,44 +1337,86 @@ export function buildProjectView(context: Context, element?: Item): Item[] {
 
 /* --- コマンド --- */
 
-/**
- * ツールバーのボタンの可否と、ConnectとDisconnectの出し分けに使う接続状態を更新する。
- *
- * デバイスは未接続 / コマンドモード / 実行モードの3状態を取り、実行モードから戻す手段はBreakのみ。
- * Disconnectは待機中の脱出口のためrunningでは無効化しない。
- */
-export function refreshButtons(context: Context) {
-  const { commandMode, running } = context.get();
+/** 状態と処理段階から、実行できる操作を決める。 */
+export function canAction(context: Context, name: string): boolean {
+  const { operation, running, commandMode } = context.get();
   const isConnected = connected(context);
-  const ready = isConnected && commandMode;
-  const compilerReady = compilerDirectory(context) !== null;
-  const idle = running === 0;
+  const idle = running === 0 && operation === null;
+  const probing = operation?.phase === 'probing' && !operation.controller.signal.aborted;
+  if (name === 'Connect') return idle && !isConnected;
+  if (name === 'Cancel') return !!operation && !operation.controller.signal.aborted
+    && ['connect', 'restart'].includes(operation.action) && ['waiting', 'opening', 'probing'].includes(operation.phase);
+  if (name === 'Disconnect') return isConnected && (!operation || ['write', 'execute'].includes(operation.action));
+  if (name === 'Restart') return isConnected && (idle || probing);
+  if (name === 'Execute') return idle && isConnected && commandMode;
+  if (name === 'Write') return idle && isConnected && commandMode && compilerDirectory(context) !== null
+    && (getSettings(context).tasks.length > 0 || activeRubyDocument(context) !== null);
+  return false;
+}
+
+export function refreshButtons(context: Context) {
   const setContext = (key: string, value: boolean) =>
     context.vscode.commands.executeCommand('setContext', `kaniburner.${key}`, value);
-  const setEnabled = (name: string, enabled: boolean) => setContext(`can${name}`, enabled);
-  setContext('connected', isConnected);
-  setEnabled('Compile', idle && !isConnected && compilerReady);
-  setEnabled('Connect', idle && !isConnected);
-  setEnabled('Disconnect', isConnected);
-  setEnabled('Write', idle && ready && compilerReady);
-  setEnabled('Execute', idle && ready);
-  setEnabled('Reset', idle && isConnected);
+  setContext('connected', connected(context));
+  for (const name of ['Compile', 'Connect', 'Cancel', 'Disconnect', 'Write', 'Execute', 'Restart']) {
+    setContext(`can${name}`, canAction(context, name));
+  }
 }
 
 export function refreshAll(context: Context) {
   context.projectProvider.refresh();
   context.deviceProvider.refresh();
   refreshButtons(context);
+  refreshStatusBar(context);
 }
 
-/** 操作を実行する。実行中はボタンを無効化する。 */
-export async function runAction(context: Context, action: () => Promise<void>) {
+export function refreshStatusBar(context: Context) {
+  const { serialPort, commandMode, runMode } = context.get();
+  const status = !serialPort ? 'Offline' : commandMode ? 'Command' : runMode ? 'Run' : 'Connected';
+  const icon = { Offline: 'debug-disconnect', Connected: 'plug', Command: 'terminal', Run: 'play' }[status];
+  context.statusBar.text = `$(${icon}) kaniburner`;
+  context.statusBar.tooltip = serialPort
+    ? `kaniburner: ${status}\n${serialPort.path} (${serialPort.baudRate} baud)`
+    : 'kaniburner: Offline\nBoard not connected.';
+  context.statusBar.accessibilityInformation = { label: `kaniburner: ${status}` };
+}
+
+export function stopOperation(context: Context) {
+  const { operation } = context.get();
+  if (!operation) return;
+  context.setOperation(null);
+  operation.controller.abort();
+  resetProtocol(context);
+  context.endAction();
+}
+
+export function cancelConnection(context: Context) {
+  if (!canAction(context, 'Cancel')) return;
+  context.setAutoConnect(false);
+  stopOperation(context);
+  logInfo(context, 'Connection attempt cancelled.');
+}
+
+/** 操作を実行する。 */
+export async function runAction<T>(context: Context, action: (operation: Operation) => Promise<T>, kind: Action = 'write'): Promise<T | undefined> {
+  if (context.get().operation || context.get().running > 0) return;
+  const operation: Operation = { action: kind, phase: 'compile', controller: new AbortController(), disconnected: false };
   context.beginAction();
+  context.setOperation(operation);
   context.output.show(true);
+  let cancel: () => void;
+  const cancelled = new Promise<undefined>((resolve) => {
+    cancel = () => resolve(undefined);
+    operation.controller.signal.addEventListener('abort', cancel, { once: true });
+  });
   try {
-    await action();
+    return await Promise.race([action(operation), cancelled]);
   } finally {
-    context.endAction();
+    operation.controller.signal.removeEventListener('abort', cancel!);
+    if (context.get().operation === operation) {
+      context.setOperation(null);
+      context.endAction();
+    }
   }
 }
 
@@ -1137,7 +1425,7 @@ export const endAction = (state: State): State => ({ ...state, running: state.ru
 
 export async function selectVersion(context: Context) {
   const picked = await context.vscode.window.showQuickPick(AVAILABLE_VERSIONS, {
-    title: 'Kaniburner: Select mruby version'
+    title: 'kaniburner: Select mruby version'
   });
   if (picked) {
     updateCompiler(context, { version: picked });
@@ -1147,7 +1435,7 @@ export async function selectVersion(context: Context) {
 
 export async function selectBaud(context: Context) {
   const picked = await context.vscode.window.showQuickPick(['9600', '19200', '115200', 'その他...'], {
-    title: 'Kaniburner: Select baud rate'
+    title: 'kaniburner: Select baud rate'
   });
   if (!picked) return;
   if (picked !== 'その他...') {
@@ -1155,7 +1443,7 @@ export async function selectBaud(context: Context) {
     return;
   }
   const input = await context.vscode.window.showInputBox({
-    title: 'Kaniburner: Baud rate',
+    title: 'kaniburner: Baud rate',
     placeHolder: 'e.g. 57600',
     validateInput: (value) => (/^[1-9][0-9]*$/.test(value.trim()) ? null : '正の整数を入力してください')
   });
@@ -1171,7 +1459,7 @@ export async function addProjectFile(context: Context, key: ProjectKey, uris: vs
   if (uris.length > 0) {
     const filenames = unregisteredFilenames(context, key, expandDirectories(context, uris));
     if (filenames.length === 0) {
-      context.vscode.window.showInformationMessage('Kaniburner: 追加できる .rb ファイルがありません。');
+      context.vscode.window.showInformationMessage('kaniburner: 追加できる .rb ファイルがありません。');
       return;
     }
     addProjectEntries(context, key, filenames);
@@ -1179,11 +1467,11 @@ export async function addProjectFile(context: Context, key: ProjectKey, uris: vs
   }
   const candidates = unregisteredFilenames(context, key, openTabUris(context));
   if (candidates.length === 0) {
-    context.vscode.window.showInformationMessage('Kaniburner: 追加できる未登録の .rb タブがありません。');
+    context.vscode.window.showInformationMessage('kaniburner: 追加できる未登録の .rb タブがありません。');
     return;
   }
   const picked = await context.vscode.window.showQuickPick(candidates, {
-    title: key === 'libraries' ? 'Kaniburner: Add library' : 'Kaniburner: Add task'
+    title: key === 'libraries' ? 'kaniburner: Add library' : 'kaniburner: Add task'
   });
   if (picked) addProjectEntries(context, key, [picked]);
 }
@@ -1202,15 +1490,19 @@ let context: Context;
 
 export function activate(extensionContext: vscode.ExtensionContext) {
   const api: typeof vscode = require('vscode');
-  const output = api.window.createOutputChannel('Kaniburner');
-  extensionContext.subscriptions.push(output);
+  const output = api.window.createOutputChannel('kaniburner');
+  const statusBar = api.window.createStatusBarItem('kaniburner.connection', api.StatusBarAlignment.Left);
+  statusBar.name = 'kaniburner';
+  statusBar.command = { command: 'workbench.action.quickOpen', title: 'kaniburner commands', arguments: ['>kaniburner: '] };
+  extensionContext.subscriptions.push(output, statusBar);
 
   context = buildContext({
     vscode: api,
     SerialPort: require('serialport').SerialPort,
     storage: extensionContext.workspaceState,
     extensionPath: extensionContext.extensionPath,
-    output
+    output,
+    statusBar
   });
 
   context.rememberEditor(api.window.activeTextEditor);
@@ -1233,8 +1525,10 @@ export function activate(extensionContext: vscode.ExtensionContext) {
     })
   );
   refreshButtons(context);
+  refreshStatusBar(context);
+  statusBar.show();
 
-  const timer = setInterval(() => pollAutoConnect(context), AUTO_CONNECT_INTERVAL);
+  const timer = setInterval(() => pollAutoConnect(context), CONNECT_INTERVAL);
   extensionContext.subscriptions.push({ dispose: () => clearInterval(timer) });
 
   // 手で編集された場合もビューへ反映する。
@@ -1266,37 +1560,25 @@ export function activate(extensionContext: vscode.ExtensionContext) {
     }
   });
 
-  register('kaniburner.compile', () => runAction(context, () => compileAndWrite(context)));
-  register('kaniburner.write', () => runAction(context, () => compileAndWrite(context)));
-
-  register('kaniburner.execute', () => runAction(context, async () => {
-    if (!await ensureReady(context)) return;
-    await execute(context);
-  }));
-
-  // ResetとBreakは1枠にまとめる。押した時の動作はresetAndReconnectが分ける。
-  const resetOrBreak = () => runAction(context, async () => {
-    if (!connected(context)) {
-      context.vscode.window.showWarningMessage('Kaniburner: Not connected.');
-      return;
-    }
-    await resetAndReconnect(context);
+  register('kaniburner.write', async () => {
+    if (canAction(context, 'Write')) await runAction(context, () => compileAndWrite(context), 'write');
   });
-  register('kaniburner.reset', resetOrBreak);
-
-  register('kaniburner.connect', () => runAction(context, async () => {
-    if (connected(context)) {
-      context.vscode.window.showInformationMessage('Kaniburner: Already connected.');
-      return;
-    }
-    if (!await ensureConnected(context)) return;
-    await prepareDevice(context, CONNECT_RETRIES);
-  }));
-
+  register('kaniburner.execute', async () => {
+    if (canAction(context, 'Execute')) await runAction(context, () => execute(context), 'execute');
+  });
+  register('kaniburner.restart', () => restartAndReconnect(context));
+  register('kaniburner.connect', async () => {
+    if (canAction(context, 'Connect')) await connectDevice(context);
+  });
+  register('kaniburner.cancel', () => cancelConnection(context));
   register('kaniburner.disconnect', async () => {
-    context.output.show(true);
+    if (!canAction(context, 'Disconnect')) return;
     logInfo(context, 'Disconnecting...');
-    await disconnect(context);
+    try {
+      await disconnect(context);
+    } catch (error) {
+      logError(context, `Disconnect failed: ${(error as Error).message}`);
+    }
   });
 }
 

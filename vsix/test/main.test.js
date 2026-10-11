@@ -49,7 +49,7 @@ function mrbwriteDevice(text) {
   if (text.startsWith('clear')) return '+OK\r\n';
   if (text.startsWith('write')) return '+OK Write bytecode\r\n';
   if (text.startsWith('execute')) return '+OK Execute\r\n';
-  if (text.startsWith('reset')) return '';
+  if (text.startsWith('reset')) return '+OK\r\n';
   return '+DONE\r\n';
 }
 
@@ -61,7 +61,7 @@ function mrbwriteDevice(text) {
  * @param setError 制御信号の設定時に返すエラー。
  * @param device 書き込みに対して同期的に返信する関数。
  */
-function createSerialPort({ ports = [], openError = null, setError = null, device = mrbwriteDevice } = {}) {
+function createSerialPort({ ports = [{ path: '/dev/x' }], openError = null, setError = null, device = mrbwriteDevice } = {}) {
   return class SerialPort {
     static instances = [];
     static list() { return Promise.resolve(ports); }
@@ -80,6 +80,7 @@ function createSerialPort({ ports = [], openError = null, setError = null, devic
     on(event, listener) { this.listeners[event] = listener; }
 
     write(buffer, callback) {
+      if (buffer.length === 0) return callback(null);
       this.written.push(buffer.toString('latin1'));
       callback(null);
       const reply = device(buffer.toString('latin1'));
@@ -87,6 +88,8 @@ function createSerialPort({ ports = [], openError = null, setError = null, devic
     }
 
     set(options, callback) { this.sets.push(options); callback(setError); }
+
+    drain(callback) { callback(null); }
 
     close(callback) {
       this.closed = true;
@@ -122,15 +125,17 @@ function createContext({ window = {}, root = null, device = {}, SerialPort = cre
     calls: [],
     executeCommand(...args) { this.calls.push(args); }
   };
+  const statusBar = { text: '', tooltip: undefined, shown: 0, show() { this.shown++; }, dispose() {} };
   const vscode = strict('vscode', {
     Uri, TreeItem, ThemeIcon, ThemeColor, EventEmitter,
+    StatusBarAlignment: { Left: 1, Right: 2 },
     TreeItemCollapsibleState: { Expanded: 1 },
     TreeItemCheckboxState: { Unchecked: 0, Checked: 1 },
     commands,
-    window: strict('vscode.window', window),
+    window: strict('vscode.window', { activeTextEditor: undefined, visibleTextEditors: [], ...window }),
     workspace: strict('vscode.workspace', { workspaceFolders: root ? [{ uri: new Uri(root) }] : undefined })
   });
-  return main.buildContext({ vscode, SerialPort, storage, extensionPath, output });
+  return main.buildContext({ vscode, SerialPort, storage, extensionPath, output, statusBar });
 }
 
 /** setContextで設定された値をまとめる。 */
@@ -199,7 +204,9 @@ describe('#feed', () => {
     assert.equal(context.get().pending, '');
   });
 
-  it('未完の行でもコマンドモードを検出すること', () => {
+  it('検証中は未完の行でもコマンドモードを検出すること', async () => {
+    await main.connect(context, '/dev/x', 9600);
+    context.setProbe({ port: context.get().serialPort, operation: null });
     main.feed(context, encode('+OK mruby/c'));
     assert.equal(context.get().commandMode, true);
   });
@@ -235,20 +242,21 @@ describe('#checkCommandModePatterns', () => {
   let context;
   beforeEach(() => { context = createContext(); });
 
-  it('+OK mruby/cでコマンドモードに入りビューを更新すること', () => {
-    main.checkCommandModePatterns(context, '+OK mruby/c v3');
+  it('検証中の+OK mruby/cでコマンドモードに入りビューを更新すること', async () => {
+    await main.connect(context, '/dev/x', 9600);
+    context.setProbe({ port: context.get().serialPort, operation: null });
+    main.checkCommandModePatterns(context, '+OK mruby/c');
     assert.equal(context.get().commandMode, true);
     assert.ok(context.output.lines.includes('[info]  Command mode entered.'));
     assert.ok(context.vscode.commands.calls.length > 0);
   });
 
-  it('execute後の+OKでコマンドモードを抜けること', () => {
+  it('受信パターンだけでExecuteの成否を変更しないこと', () => {
     context.enterCommandMode();
     context.beginExecute();
     main.checkCommandModePatterns(context, '+OK Execute');
-    assert.equal(context.get().commandMode, false);
-    assert.equal(context.get().lastCommand, null);
-    assert.ok(context.output.lines.includes('[info]  Command mode exited.'));
+    assert.equal(context.get().commandMode, true);
+    assert.equal(context.get().lastCommand, 'execute');
   });
 
   it('execute以外の+OKではコマンドモードを維持すること', () => {
@@ -260,7 +268,7 @@ describe('#checkCommandModePatterns', () => {
   it('コマンドモード中の+OK mruby/cでは抜けないこと', () => {
     context.enterCommandMode();
     context.beginExecute();
-    main.checkCommandModePatterns(context, '+OK mruby/c v3');
+    main.checkCommandModePatterns(context, '+OK mruby/c');
     assert.equal(context.get().commandMode, true);
   });
 });
@@ -281,7 +289,7 @@ describe('#resetProtocol', () => {
 
 describe('#waitForResponse', () => {
   it('タイムアウトするとnullを返すこと', async (t) => {
-    t.mock.timers.enable({ apis: ['setTimeout'] });
+    t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
     const context = createContext();
     const response = main.waitForResponse(context, 5000);
     await advance(t, 5000);
@@ -290,7 +298,7 @@ describe('#waitForResponse', () => {
   });
 
   it('解決後はタイマーを止めること', async (t) => {
-    t.mock.timers.enable({ apis: ['setTimeout'] });
+    t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
     const context = createContext();
     const response = main.waitForResponse(context, 5000);
     main.handleLine(context, '+OK', false);
@@ -327,7 +335,7 @@ describe('#ensureCommandMode', () => {
   });
 
   it('CRLFを送ってコマンドモードに入ること', async (t) => {
-    t.mock.timers.enable({ apis: ['setTimeout'] });
+    t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
     const context = createContext();
     await main.connect(context, '/dev/fake', 9600);
     const result = main.ensureCommandMode(context, 3);
@@ -338,7 +346,7 @@ describe('#ensureCommandMode', () => {
   });
 
   it('再試行を使い切るとfalseを返すこと', async (t) => {
-    t.mock.timers.enable({ apis: ['setTimeout'] });
+    t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
     const context = createContext({ SerialPort: createSerialPort({ device: () => '' }) });
     await main.connect(context, '/dev/fake', 9600);
     const result = main.ensureCommandMode(context, 2);
@@ -353,10 +361,31 @@ describe('#ensureCommandMode', () => {
     assert.ok(context.output.lines.includes('[error] Command mode transition timed out (2s).'));
   });
 
-  it('送信に失敗するとfalseを返すこと', async () => {
+  it('未接続では確立を試行しないこと', async () => {
     const context = createContext();
     assert.equal(await main.ensureCommandMode(context, 3), false);
-    assert.ok(context.output.lines.includes('[error] Send error: Not connected'));
+    assert.equal(context.output.lines.length, 0);
+  });
+
+  it('接続試行以外では送信タイムアウトを記録すること', async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+    const context = createContext();
+    await main.connect(context, '/dev/fake', 9600);
+    context.get().serialPort.write = () => {};
+    const result = main.ensureCommandMode(context, 1);
+    await advance(t, 5000);
+    assert.equal(await result, false);
+    assert.ok(context.output.lines.includes('[error] Send error: Serial write timed out.'));
+  });
+
+  it('Connect・Restart中もタイムアウト以外の送信エラーは記録すること', async () => {
+    for (const action of ['connect', 'restart']) {
+      const context = createContext();
+      await main.connect(context, '/dev/fake', 9600);
+      context.get().serialPort.write = (_, callback) => callback(new Error('busy'));
+      assert.equal(await main.runAction(context, () => main.ensureCommandMode(context, 1), action), false);
+      assert.ok(context.output.lines.includes('[error] Send error: busy'));
+    }
   });
 });
 
@@ -424,7 +453,7 @@ describe('#readBoardInfo', () => {
   });
 
   it('応答が無くてもコマンドモードの準備は成功すること', async (t) => {
-    t.mock.timers.enable({ apis: ['setTimeout'] });
+    t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
     const context = createContext({ SerialPort: createSerialPort({ device: () => '' }) });
     await main.connect(context, '/dev/x', 9600);
     context.enterCommandMode();
@@ -550,7 +579,7 @@ describe('#writeBytecodes', () => {
   });
 
   it('+DONEが返らないとfalseを返すこと', async (t) => {
-    t.mock.timers.enable({ apis: ['setTimeout'] });
+    t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
     const device = (text) => (text.startsWith('clear') ? '+OK\r\n' : text.startsWith('write') ? '+OK Write bytecode\r\n' : '');
     context = createContext({ SerialPort: createSerialPort({ device }) });
     await main.connect(context, '/dev/fake', 9600);
@@ -559,7 +588,7 @@ describe('#writeBytecodes', () => {
     await flush();
     await advance(t, 10000);
     assert.equal(await result, false);
-    assert.ok(context.output.lines.includes('[error] Write response timeout or unexpected: null'));
+    assert.ok(context.output.lines.includes('[error] Write failed: null'));
   });
 });
 
@@ -568,9 +597,85 @@ describe('#execute', () => {
     const context = createContext();
     await main.connect(context, '/dev/fake', 9600);
     context.enterCommandMode();
-    await main.execute(context);
+    await main.runAction(context, () => main.execute(context), 'execute');
     assert.deepEqual(context.get().serialPort.written, ['execute\r\n']);
     assert.equal(context.get().commandMode, false);
+    assert.equal(context.get().runMode, true);
+    assert.equal(context.get().operation, null);
+    assert.equal(context.statusBar.text, '$(play) kaniburner');
+    assert.equal(context.statusBar.tooltip, 'kaniburner: Run\n/dev/fake (9600 baud)');
+    assert.deepEqual(context.statusBar.accessibilityInformation, { label: 'kaniburner: Run' });
+  });
+
+  it('Execute拒否ではCommand表示を維持すること', async () => {
+    const context = createContext({ SerialPort: createSerialPort({ device: () => '-ERR Illegal command.\r\n' }) });
+    await main.connect(context, '/dev/x', 9600);
+    context.enterCommandMode();
+    await main.execute(context);
+    assert.equal(context.get().runMode, false);
+    assert.equal(context.statusBar.text, '$(terminal) kaniburner');
+  });
+
+  it('ExecuteタイムアウトではRunを表示しないこと', async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+    const context = createContext({ SerialPort: createSerialPort({ device: () => '' }) });
+    await main.connect(context, '/dev/x', 9600);
+    context.enterCommandMode();
+    const result = main.execute(context);
+    assert.equal(context.statusBar.text, '$(terminal) kaniburner');
+    await advance(t, 5000);
+    await result;
+    assert.equal(context.get().runMode, false);
+    assert.equal(context.statusBar.text, '$(plug) kaniburner');
+  });
+
+  it('Execute応答より先に実行開始通知を受けてもRunを保持すること', async () => {
+    const context = createContext({ SerialPort: createSerialPort({ device: () => 'Kani-Board, mruby/c v3.3 start\r\n' }) });
+    await main.connect(context, '/dev/x', 9600);
+    context.enterCommandMode();
+    await main.execute(context);
+    assert.equal(context.get().runMode, true);
+    assert.equal(context.statusBar.text, '$(play) kaniburner');
+    assert.ok(!context.output.lines.includes('[error] Execute response timed out.'));
+  });
+
+  it('Execute応答直後の再起動通知をRunで上書きしないこと', async () => {
+    const context = createContext({ SerialPort: createSerialPort({ device: () => '+OK Execute\r\nKani-Board, Please push Enter key to mrbwrite mode\r\n' }) });
+    await main.connect(context, '/dev/x', 9600);
+    context.enterCommandMode();
+    await main.execute(context);
+    assert.equal(context.get().runMode, false);
+    assert.equal(context.statusBar.text, '$(plug) kaniburner');
+  });
+
+  it('Execute成功後に分割受信した実行開始通知でRunになること', async () => {
+    const context = createContext({ SerialPort: createSerialPort({ device: () => '+OK \r\n' }) });
+    await main.connect(context, '/dev/x', 9600);
+    context.enterCommandMode();
+    await main.runAction(context, () => main.execute(context), 'execute');
+    const port = context.get().serialPort;
+    port.receive('\r\nKani-Board, End mrbwrite mode\r\nKani-Board, mruby/c v4.0.0 st');
+    port.receive('art\r\n');
+    assert.equal(context.get().runMode, true);
+    assert.equal(context.statusBar.text, '$(play) kaniburner');
+    assert.equal(context.statusBar.tooltip, 'kaniburner: Run\n/dev/x (9600 baud)');
+  });
+
+  it('Execute応答と通知の任意の受信境界でもRunになること', async () => {
+    const reply = '+OK \r\n\r\nKani-Board, End mrbwrite mode\r\nKani-Board, mruby/c v4.0.0 start\r\n';
+    for (let split = 0; split <= reply.length; split++) {
+      const context = createContext({ SerialPort: createSerialPort({ device: () => '' }) });
+      await main.connect(context, '/dev/x', 9600);
+      context.enterCommandMode();
+      const result = main.runAction(context, () => main.execute(context), 'execute');
+      const port = context.get().serialPort;
+      port.receive(reply.slice(0, split));
+      await flush();
+      port.receive(reply.slice(split));
+      await result;
+      assert.equal(context.get().runMode, true, `split=${split}`);
+      assert.equal(context.statusBar.text, '$(play) kaniburner', `split=${split}`);
+    }
   });
 });
 
@@ -588,7 +693,7 @@ describe('#connect', () => {
     const context = createContext();
     await main.connect(context, '/dev/fake', 9600);
     context.get().serialPort.receive('+OK mruby/c');
-    assert.equal(context.get().commandMode, true);
+    assert.equal(context.get().commandMode, false);
     assert.equal(context.output.text, '+OK mruby/c');
   });
 
@@ -649,6 +754,93 @@ describe('#disconnect', () => {
     await main.disconnect(context);
     assert.equal(main.connected(context), false);
   });
+
+  it('送信とdrainが完了するまでポートを閉じないこと', async () => {
+    const context = createContext();
+    await main.connect(context, '/dev/fake', 9600);
+    const port = context.get().serialPort;
+    let write, drain;
+    port.write = (_, callback) => { write = callback; };
+    port.drain = (callback) => { drain = callback; };
+    const result = main.disconnect(context);
+    assert.equal(port.closed, false);
+    assert.equal(main.canAction(context, 'Disconnect'), false);
+    assert.equal(drain, undefined);
+    write();
+    await flush();
+    assert.equal(port.closed, false);
+    drain();
+    await result;
+    assert.equal(port.closed, true);
+    assert.equal(main.connected(context), false);
+  });
+
+  it('送信とdrainの共通の0.5秒期限で切断し、中断通知をエラーにしないこと', async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+    const context = createContext();
+    await main.connect(context, '/dev/fake', 9600);
+    const port = context.get().serialPort;
+    let write, drain;
+    port.write = (_, callback) => { write = callback; };
+    port.drain = (callback) => { drain = callback; };
+    const close = port.close.bind(port);
+    port.close = (callback) => {
+      port.listeners.error(new Error('Writing to COM port (GetOverlappedResult): Operation aborted'));
+      close(callback);
+    };
+    const result = main.disconnect(context);
+    await advance(t, 400);
+    write();
+    await advance(t, 99);
+    assert.equal(port.closed, false);
+    await advance(t, 1);
+    await result;
+    drain();
+    assert.equal(port.closed, true);
+    assert.equal(main.connected(context), false);
+    assert.equal(context.output.lines.some((line) => line.startsWith('[error]')), false);
+  });
+
+  it('送信待ちの期限超過後の遅い完了でdrainを始めないこと', async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+    const context = createContext();
+    await main.connect(context, '/dev/fake', 9600);
+    const port = context.get().serialPort;
+    let write;
+    port.write = (_, callback) => { write = callback; };
+    const drain = t.mock.method(port, 'drain');
+    const result = main.disconnect(context);
+    await advance(t, 500);
+    await result;
+    write();
+    assert.equal(port.closed, true);
+    assert.equal(drain.mock.callCount(), 0);
+  });
+
+  it('Disconnect以外のシリアルエラーは記録し、closeの失敗はrejectすること', async () => {
+    const context = createContext();
+    await main.connect(context, '/dev/fake', 9600);
+    const port = context.get().serialPort;
+    port.isOpen = true;
+    port.listeners.error(new Error('read failed'));
+    assert.ok(context.output.lines.includes('[error] Serial error: read failed'));
+    port.close = (callback) => callback(new Error('close failed'));
+    await assert.rejects(main.disconnect(context), /close failed/);
+    assert.equal(context.get().serialPort, port);
+    assert.equal(main.canAction(context, 'Disconnect'), true);
+  });
+
+  it('closeの期限超過はrejectすること', async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+    const context = createContext();
+    await main.connect(context, '/dev/fake', 9600);
+    context.get().serialPort.close = () => {};
+    const result = assert.rejects(main.disconnect(context), /Serial port close timed out/);
+    await advance(t, 5000);
+    await result;
+    assert.equal(context.get().operation, null);
+    assert.equal(context.get().running, 0);
+  });
 });
 
 describe('#write', () => {
@@ -662,6 +854,23 @@ describe('#write', () => {
     await main.connect(context, '/dev/fake', 9600);
     await main.write(context, new Uint8Array([0x41, 0x42]));
     assert.deepEqual(context.get().serialPort.written, ['AB']);
+  });
+
+  it('通常の送信は0.5秒を超えても5秒までは完了を待つこと', async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+    const context = createContext();
+    await main.connect(context, '/dev/fake', 9600);
+    let write, status = null;
+    context.get().serialPort.write = (_, callback) => { write = callback; };
+    const result = main.write(context, new Uint8Array([1])).then(
+      () => { status = 'written'; },
+      (error) => { status = error; }
+    );
+    await advance(t, 4999);
+    assert.equal(status, null);
+    write();
+    await result;
+    assert.equal(status, 'written');
   });
 });
 
@@ -849,7 +1058,7 @@ describe('#updateCompiler', () => {
     const warnings = [];
     const context = createContext({ window: { showWarningMessage: (message) => warnings.push(message) } });
     main.updateCompiler(context, { version: '3.4.0' });
-    assert.deepEqual(warnings, ['Kaniburner: プロジェクト設定を保存するにはフォルダを開いてください。']);
+    assert.deepEqual(warnings, ['kaniburner: プロジェクト設定を保存するにはフォルダを開いてください。']);
   });
 });
 
@@ -928,7 +1137,7 @@ describe('#resolveCompilerVersion', () => {
   let root, context;
   beforeEach(async () => {
     root = makeWorkspace();
-    context = createContext({ root });
+    context = createContext({ root, window: { activeTextEditor: { document: document('/main.rb', 'puts 1') } } });
     await main.connect(context, '/dev/x', 9600);
     context.enterCommandMode();
   });
@@ -970,14 +1179,14 @@ describe('#resolveCompilerVersion', () => {
     }
   });
 
-  it('切断後は手動設定へ戻り、Compileを使用できること', async () => {
+  it('切断後は手動設定へ戻り、Writeを無効にすること', async () => {
     main.updateCompiler(context, { version: '4.0.0' });
     context.setBoardInfo(main.parseBoardInfo('+OK mruby/c v3.3 RITE0300'));
     await main.disconnect(context);
     const selected = main.resolveCompilerVersion(context);
     assert.equal(selected.version, '4.0.0');
     assert.match(selected.warning, /接続されていません/);
-    assert.equal(contextValues(context)['kaniburner.canCompile'], true);
+    assert.equal(contextValues(context)['kaniburner.canCompile'], false);
   });
 });
 
@@ -1012,16 +1221,17 @@ describe('#compileAndWrite', () => {
   });
   afterEach(() => fs.rmSync(root, { recursive: true }));
 
-  it('未接続ならコンパイルだけを行うこと', async () => {
+  it('未接続ならコンパイルも書込みも行わないこと', async () => {
     await main.compileAndWrite(context);
     assert.equal(context.SerialPort.instances.length, 0);
-    assert.equal(context.get().mrbcDirectory, path.join(root, 'media', 'mruby-4.0.0'));
-    assert.ok(context.output.lines.includes('[info]  Compile succeeded. (4 bytes)'));
+    assert.equal(context.get().mrbcDirectory, null);
+    assert.equal(context.output.lines.length, 0);
   });
 
   it('接続中は判定してからコンパイル・書き込みを行うこと', async () => {
     await main.connect(context, '/dev/x', 9600);
     context.enterCommandMode();
+    await main.readBoardInfo(context);
     await main.compileAndWrite(context);
     assert.equal(context.get().mrbcDirectory, path.join(root, 'media', 'mruby-3.4.0'));
     assert.ok(context.output.lines.includes('[info]  Compiling (mruby 3.4.0)...'));
@@ -1032,6 +1242,7 @@ describe('#compileAndWrite', () => {
     context.SerialPort = createSerialPort({ device: (text) => text === 'version\r\n' ? '-ERR Illegal command.\r\n' : mrbwriteDevice(text) });
     await main.connect(context, '/dev/x', 9600);
     context.enterCommandMode();
+    await main.readBoardInfo(context);
     await main.compileAndWrite(context);
     assert.equal(context.get().mrbcDirectory, path.join(root, 'media', 'mruby-4.0.0'));
     assert.ok(main.resolveCompilerVersion(context).warning);
@@ -1039,13 +1250,14 @@ describe('#compileAndWrite', () => {
   });
 
   it('判定がタイムアウトしても書き込みを続行すること', async (t) => {
-    t.mock.timers.enable({ apis: ['setTimeout'] });
+    t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
     context.SerialPort = createSerialPort({ device: (text) => text === 'version\r\n' ? '' : mrbwriteDevice(text) });
     await main.connect(context, '/dev/x', 9600);
     context.enterCommandMode();
-    const result = main.compileAndWrite(context);
+    const result = main.readBoardInfo(context);
     await advance(t, 5000);
     await result;
+    await main.compileAndWrite(context);
     assert.equal(context.get().mrbcDirectory, path.join(root, 'media', 'mruby-4.0.0'));
     assert.ok(context.output.lines.includes('[info]  Write completed.'));
   });
@@ -1054,6 +1266,7 @@ describe('#compileAndWrite', () => {
     context.vscode.window.activeTextEditor.document = document(path.join(root, 'main.rb'), 'fail');
     await main.connect(context, '/dev/x', 9600);
     context.enterCommandMode();
+    await main.readBoardInfo(context);
     await main.compileAndWrite(context);
     assert.deepEqual(context.get().serialPort.written, ['version\r\n']);
   });
@@ -1151,14 +1364,14 @@ describe('#readSources', () => {
     const warnings = [];
     const context = createContext({ root, window: { showWarningMessage: (message) => warnings.push(message) } });
     assert.equal(main.readSources(context, [{ filename: 'a.rb' }, { filename: 'missing.rb' }], 'tasks'), null);
-    assert.deepEqual(warnings, ['Kaniburner: tasks のファイルを開けません: missing.rb']);
+    assert.deepEqual(warnings, ['kaniburner: tasks のファイルを開けません: missing.rb']);
   });
 
   it('ワークスペースを開いていなければ警告してnullを返すこと', () => {
     const warnings = [];
     const context = createContext({ window: { showWarningMessage: (message) => warnings.push(message) } });
     assert.equal(main.readSources(context, [{ filename: 'a.rb' }], 'libraries'), null);
-    assert.deepEqual(warnings, ['Kaniburner: libraries のファイルを開けません: a.rb']);
+    assert.deepEqual(warnings, ['kaniburner: libraries のファイルを開けません: a.rb']);
   });
 });
 
@@ -1184,7 +1397,7 @@ describe('#resolveTaskSources', () => {
       activeTextEditor: undefined, visibleTextEditors: [], showWarningMessage: (message) => warnings.push(message)
     } });
     assert.equal(main.resolveTaskSources(context), null);
-    assert.deepEqual(warnings, ['Kaniburner: .rbファイルを開いてください']);
+    assert.deepEqual(warnings, ['kaniburner: .rbファイルを開いてください']);
   });
 });
 
@@ -1243,9 +1456,9 @@ const PORTS = [{ path: '/dev/a', manufacturer: 'Acme', vendorId: '1234', product
 describe('#pickPort', () => {
   it('ポートが無ければエラーを表示してnullを返すこと', async () => {
     const errors = [];
-    const context = createContext({ window: { showErrorMessage: (message) => errors.push(message) } });
+    const context = createContext({ SerialPort: createSerialPort({ ports: [] }), window: { showErrorMessage: (message) => errors.push(message) } });
     assert.equal(await main.pickPort(context), null);
-    assert.deepEqual(errors, ['Kaniburner: No serial ports found.']);
+    assert.deepEqual(errors, ['kaniburner: No serial ports found.']);
   });
 
   it('一覧の取得に失敗したら記録してnullを返すこと', async () => {
@@ -1321,18 +1534,18 @@ describe('#ensureConnected', () => {
   });
 });
 
-describe('#resetAndReconnect', () => {
+describe('#restartAndReconnect', () => {
   it('未接続ならfalseを返すこと', async () => {
-    assert.equal(await main.resetAndReconnect(createContext()), false);
+    assert.equal(await main.restartAndReconnect(createContext()), false);
   });
 
   it('コマンドモード中はresetを送り、再接続してコマンドモードへ入ること', async (t) => {
-    t.mock.timers.enable({ apis: ['setTimeout'] });
+    t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
     const context = createContext({ device: { port: '/dev/x' }, SerialPort: createSerialPort({ ports: [{ path: '/dev/x' }] }) });
     await main.connect(context, '/dev/x', 19200);
     const first = context.get().serialPort;
     context.enterCommandMode();
-    const result = main.resetAndReconnect(context);
+    const result = main.restartAndReconnect(context);
     await flush();
     assert.deepEqual(first.written, ['reset\r\n']);
     first.listeners.close();
@@ -1345,11 +1558,11 @@ describe('#resetAndReconnect', () => {
   });
 
   it('実行モード中はBREAKを送ること', async (t) => {
-    t.mock.timers.enable({ apis: ['setTimeout'] });
+    t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
     const context = createContext({ device: { port: '/dev/x' }, SerialPort: createSerialPort({ ports: [{ path: '/dev/x' }] }) });
     await main.connect(context, '/dev/x', 19200);
     const first = context.get().serialPort;
-    const result = main.resetAndReconnect(context);
+    const result = main.restartAndReconnect(context);
     await advance(t, 100);
     assert.deepEqual(first.sets, [
       { brk: false, dtr: true, rts: true },
@@ -1364,53 +1577,489 @@ describe('#resetAndReconnect', () => {
   });
 
   it('ポートが再出現しなければfalseを返すこと', async (t) => {
-    t.mock.timers.enable({ apis: ['setTimeout'] });
+    t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
     const context = createContext({ device: { port: '/dev/x' }, SerialPort: createSerialPort({ ports: [] }) });
     await main.connect(context, '/dev/x', 19200);
     context.enterCommandMode();
-    const result = main.resetAndReconnect(context);
+    const result = main.restartAndReconnect(context);
     await flush();
     context.get().serialPort.listeners.close();
-    for (let second = 0; second < 30; second++) await advance(t, 1000);
+    for (let second = 0; second < 60; second++) await advance(t, 1000);
     assert.equal(await result, false);
     assert.equal(context.SerialPort.instances.length, 1);
   });
 });
 
-describe('#ensureReady', () => {
-  it('接続してコマンドモードへ入ること', async (t) => {
-    t.mock.timers.enable({ apis: ['setTimeout'] });
-    const context = createContext({ device: { port: '/dev/x' } });
-    const result = main.ensureReady(context);
-    await advance(t, 1000);
-    assert.equal(await result, true);
-    assert.equal(context.get().commandMode, true);
+describe('#connectionLifecycle', () => {
+  it('Cancelでポートを残し、再送と遅い応答による確立を止めること', async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+    const context = createContext({ device: { port: '/dev/x' }, SerialPort: createSerialPort({ device: () => '' }) });
+    context.setAutoConnect(true);
+    const result = main.connectDevice(context);
+    await flush();
+    const port = context.get().serialPort;
+    assert.equal(main.canAction(context, 'Cancel'), true);
+    assert.equal(main.canAction(context, 'Disconnect'), false);
+    assert.equal(main.canAction(context, 'Restart'), true);
+    main.cancelConnection(context);
+    port.receive('+OK mruby/c\r\n');
+    await advance(t, 10000);
+    assert.equal(await result, false);
+    assert.equal(context.get().serialPort, port);
+    assert.equal(context.get().commandMode, false);
+    assert.equal(context.get().autoConnect, false);
+    assert.deepEqual(port.written, ['\r\n']);
+    assert.equal(main.canAction(context, 'Disconnect'), true);
+    assert.equal(context.get().running, 0);
   });
 
-  it('接続できなければfalseを返すこと', async () => {
-    const context = createContext({ device: { port: '/dev/x' }, SerialPort: createSerialPort({ openError: new Error('busy') }) });
-    assert.equal(await main.ensureReady(context), false);
+  it('Connect検証中の送信タイムアウトは記録せず、再試行すること', async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+    const Base = createSerialPort();
+    class SerialPort extends Base {
+      write(buffer) { this.written.push(buffer.toString('latin1')); }
+    }
+    const context = createContext({ device: { port: '/dev/x' }, SerialPort });
+    const result = main.connectDevice(context);
+    await advance(t, 5000);
+    assert.deepEqual(context.get().serialPort.written, ['\r\n', '\r\n']);
+    assert.ok(context.output.lines.includes('[info]  Entering command mode... (5/60s)'));
+    assert.ok(!context.output.lines.some((line) => line.startsWith('[error]')));
+    assert.equal(main.canAction(context, 'Disconnect'), false);
+    main.cancelConnection(context);
+    assert.equal(await result, false);
+    assert.equal(main.canAction(context, 'Disconnect'), true);
   });
 
-  it('直接コマンドモードへ入れなければリセットして入り直すこと', async (t) => {
-    t.mock.timers.enable({ apis: ['setTimeout'] });
-    let attempts = 0;
-    const device = (text) => (text === '\r\n' ? (++attempts > 3 ? '+OK mruby/c\r\n' : '') : mrbwriteDevice(text));
-    const context = createContext({ device: { port: '/dev/x' }, SerialPort: createSerialPort({ ports: [{ path: '/dev/x' }], device }) });
-    const result = main.ensureReady(context);
-    for (let second = 0; second < 3; second++) await advance(t, 1000);
-    const first = context.get().serialPort;
+  it('Restart検証中の送信タイムアウトは記録せず、Cancel後にDisconnectを許可すること', async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+    const context = createContext();
+    await main.connect(context, '/dev/x', 9600);
+    const port = context.get().serialPort;
+    port.write = (buffer) => { port.written.push(buffer.toString('latin1')); };
+    const result = main.restartAndReconnect(context);
+    assert.equal(main.canAction(context, 'Disconnect'), false);
     await advance(t, 100);
-    assert.deepEqual(first.sets, [
-      { brk: false, dtr: true, rts: true },
-      { brk: true, dtr: true, rts: true },
-      { brk: false, dtr: true, rts: true }
-    ]);
-    first.listeners.close();
+    await advance(t, 1000);
+    await advance(t, 5000);
+    assert.deepEqual(port.written, ['\r\n', '\r\n']);
+    assert.ok(context.output.lines.includes('[info]  Entering command mode... (6/60s)'));
+    assert.ok(!context.output.lines.some((line) => line.startsWith('[error]')));
+    assert.equal(main.canAction(context, 'Cancel'), true);
+    assert.equal(main.canAction(context, 'Disconnect'), false);
+    main.cancelConnection(context);
+    assert.equal(await result, false);
+    assert.equal(main.canAction(context, 'Disconnect'), true);
+  });
+
+  it('確立応答が先ならCancelで成功を覆さないこと', async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+    const context = createContext({ device: { port: '/dev/x' } });
+    const result = main.connectDevice(context);
+    await flush();
+    assert.equal(context.get().commandMode, true);
+    assert.equal(main.canAction(context, 'Cancel'), false);
+    main.cancelConnection(context);
+    await advance(t, 1000);
+    assert.equal(await result, true);
+  });
+
+  it('Connect検証中のcloseも同じポートへ再接続すること', async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+    const SerialPort = createSerialPort({ device: (text) => SerialPort.instances.length > 1 ? mrbwriteDevice(text) : '' });
+    const context = createContext({ device: { port: '/dev/x' }, SerialPort });
+    const result = main.connectDevice(context);
+    await flush();
+    context.get().serialPort.listeners.close();
     await advance(t, 1000);
     await advance(t, 1000);
     assert.equal(await result, true);
     assert.equal(context.get().commandMode, true);
+    assert.equal(context.SerialPort.instances.length, 2);
+  });
+
+  it('Restart検証中の遅いcloseでも同じポートへの復旧を続けること', async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+    const SerialPort = createSerialPort({ ports: [{ path: '/dev/x' }], device: (text) => SerialPort.instances.length > 1 || text === 'reset\r\n' ? mrbwriteDevice(text) : '' });
+    const context = createContext({ device: { port: '/dev/x' }, SerialPort });
+    await main.connect(context, '/dev/x', 19200);
+    context.enterCommandMode();
+    const port = context.get().serialPort;
+    const result = main.restartAndReconnect(context);
+    port.receive('Kani-Board, Please push Enter key to mrbwrite mode\r\n');
+    await advance(t, 1000);
+    assert.equal(context.get().operation.phase, 'probing');
+    main.updateDevice(context, { port: '/dev/other', baud: 9600 });
+    port.listeners.close();
+    for (let i = 0; i < 5; i++) await advance(t, 1000);
+    assert.equal(await result, true);
+    assert.equal(context.get().serialPort.path, '/dev/x');
+    assert.equal(context.get().serialPort.baudRate, 19200);
+    assert.equal(SerialPort.instances.length, 2);
+  });
+
+  it('ポートが残るRestartは+OKを待ち、起動通知なしで確立すること', async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+    const context = createContext({ SerialPort: createSerialPort({ device: (text) => text === 'reset\r\n' ? '' : mrbwriteDevice(text) }) });
+    await main.connect(context, '/dev/x', 9600);
+    context.enterCommandMode();
+    const port = context.get().serialPort;
+    const result = main.restartAndReconnect(context);
+    await advance(t, 1000);
+    assert.deepEqual(port.written, ['reset\r\n']);
+    port.receive('+OK mruby/c\r\n');
+    await advance(t, 1000);
+    assert.deepEqual(port.written, ['reset\r\n']);
+    port.receive('+OK\r\n');
+    await advance(t, 1000);
+    await advance(t, 1000);
+    assert.equal(await result, true);
+    assert.equal(context.get().serialPort, port);
+    assert.equal(context.SerialPort.instances.length, 1);
+  });
+
+  it('reset拒否時は検証を始めずポートのみ接続へ戻ること', async () => {
+    const context = createContext({ SerialPort: createSerialPort({ device: () => '-ERR Illegal command.\r\n' }) });
+    await main.connect(context, '/dev/x', 9600);
+    context.enterCommandMode();
+    const port = context.get().serialPort;
+    assert.equal(await main.restartAndReconnect(context), false);
+    assert.deepEqual(port.written, ['reset\r\n']);
+    assert.equal(context.get().serialPort, port);
+    assert.equal(context.get().commandMode, false);
+    assert.equal(main.canAction(context, 'Restart'), true);
+  });
+
+  it('Connectも未出現ポートを待ち、毎回のlistを記録し、Cancelで未接続へ戻ること', async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+    const context = createContext({ device: { port: '/dev/x' }, SerialPort: createSerialPort({ ports: [] }) });
+    let lists = 0;
+    context.SerialPort.list = async () => { lists++; return []; };
+    const result = main.connectDevice(context);
+    await advance(t, 1000);
+    await advance(t, 1000);
+    assert.equal(lists, 3);
+    assert.equal(context.output.lines.filter((line) => line.includes('Listing ports')).length, lists);
+    assert.ok(context.output.lines.some((line) => line.includes('(2/60s)')));
+    assert.equal(main.canAction(context, 'Cancel'), true);
+    main.cancelConnection(context);
+    await advance(t, 1000);
+    assert.equal(await result, false);
+    assert.equal(lists, 3);
+    assert.equal(context.get().serialPort, null);
+    assert.equal(main.canAction(context, 'Connect'), true);
+  });
+
+  it('Connectのopen待ちもCancelでき、遅い成功を回収すること', async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+    let release;
+    const Base = createSerialPort();
+    class SerialPort extends Base {
+      constructor(options, callback) { super(options, (error) => { release = () => callback(error); }); }
+    }
+    const context = createContext({ device: { port: '/dev/x' }, SerialPort });
+    const result = main.connectDevice(context);
+    await flush();
+    assert.equal(context.get().operation.phase, 'opening');
+    assert.equal(main.canAction(context, 'Cancel'), true);
+    main.cancelConnection(context);
+    release();
+    await flush();
+    assert.equal(await result, false);
+    assert.equal(context.get().serialPort, null);
+    assert.equal(Base.instances[0].closed, true);
+  });
+
+  it('Connectのlistが応答しなくても共通の60秒期限で終了すること', async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+    const context = createContext({ device: { port: '/dev/x' } });
+    context.SerialPort.list = () => new Promise(() => {});
+    const result = main.connectDevice(context);
+    await advance(t, 60000);
+    assert.equal(await result, false);
+    assert.equal(context.get().operation, null);
+    assert.equal(main.canAction(context, 'Connect'), true);
+  });
+
+  it('一覧・open失敗から再試行し、Connect開始時の接続先を保つこと', async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+    const Base = createSerialPort();
+    class SerialPort extends Base {
+      constructor(options, callback) {
+        super(options, (error) => callback(Base.instances.length === 1 ? new Error('busy') : error));
+      }
+    }
+    let lists = 0;
+    SerialPort.list = async () => {
+      if (++lists === 1) throw new Error('list failed');
+      return [{ path: '/dev/x' }];
+    };
+    const context = createContext({ device: { port: '/dev/x', baud: 19200 }, SerialPort });
+    const result = main.connectDevice(context);
+    await flush();
+    main.updateDevice(context, { port: '/dev/other', baud: 9600 });
+    for (let second = 0; second < 3; second++) await advance(t, 1000);
+    assert.equal(await result, true);
+    assert.equal(lists, 3);
+    assert.equal(Base.instances.length, 2);
+    assert.equal(context.get().serialPort.path, '/dev/x');
+    assert.equal(context.get().serialPort.baudRate, 19200);
+    assert.ok(context.output.lines.includes('[error] Connect failed: list failed'));
+    assert.ok(context.output.lines.includes('[error] Connect failed: busy'));
+  });
+
+  it('検証と再openを往復してもConnectの期限を延長しないこと', async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+    const context = createContext({ device: { port: '/dev/x' }, SerialPort: createSerialPort({ device: () => '' }) });
+    const result = main.connectDevice(context);
+    for (let second = 0; second < 60; second++) {
+      if (second === 20 || second === 40) context.get().serialPort.listeners.close();
+      await advance(t, 1000);
+    }
+    assert.equal(await result, false);
+    assert.equal(context.SerialPort.instances.length, 3);
+    assert.notEqual(context.get().serialPort, null);
+    assert.equal(context.get().commandMode, false);
+    assert.equal(main.canAction(context, 'Restart'), true);
+  });
+
+  it('reset応答期限超過はCRLF検証を始めずポートを残すこと', async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+    const context = createContext({ SerialPort: createSerialPort({ device: () => '' }) });
+    await main.connect(context, '/dev/x', 9600);
+    context.enterCommandMode();
+    const port = context.get().serialPort;
+    const result = main.restartAndReconnect(context);
+    await advance(t, 5000);
+    assert.equal(await result, false);
+    assert.deepEqual(port.written, ['reset\r\n']);
+    assert.equal(context.get().serialPort, port);
+    assert.equal(context.get().commandMode, false);
+    assert.equal(context.get().operation, null);
+  });
+
+  it('reset送信の完了前にUSBが切断されても復旧を続けること', async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+    const context = createContext({ SerialPort: createSerialPort({ ports: [{ path: '/dev/x' }] }) });
+    await main.connect(context, '/dev/x', 9600);
+    context.enterCommandMode();
+    const port = context.get().serialPort;
+    port.write = (buffer, callback) => {
+      port.listeners.close();
+      callback(new Error('Disconnected'));
+    };
+    const result = main.restartAndReconnect(context);
+    await advance(t, 1000);
+    await advance(t, 1000);
+    assert.equal(await result, true);
+    assert.notEqual(context.get().serialPort, port);
+  });
+
+  it('Break制御の完了前にUSBが切断されても復旧を続けること', async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+    const context = createContext({ SerialPort: createSerialPort({ ports: [{ path: '/dev/x' }] }) });
+    await main.connect(context, '/dev/x', 9600);
+    const port = context.get().serialPort;
+    port.set = (options, callback) => {
+      port.listeners.close();
+      callback(new Error('Disconnected'));
+    };
+    const result = main.restartAndReconnect(context);
+    await advance(t, 1000);
+    await advance(t, 1000);
+    assert.equal(await result, true);
+    assert.notEqual(context.get().serialPort, port);
+  });
+
+  it('RestartでConnectの検証を入れ替え、古い終了処理で新しい操作を消さないこと', async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+    let reply = false;
+    const context = createContext({ device: { port: '/dev/x' }, SerialPort: createSerialPort({ device: (text) => reply ? mrbwriteDevice(text) : '' }) });
+    const connection = main.connectDevice(context);
+    await flush();
+    const restart = main.restartAndReconnect(context);
+    await advance(t, 100);
+    assert.equal(await connection, false);
+    assert.equal(context.get().operation.action, 'restart');
+    assert.equal(context.get().running, 1);
+    reply = true;
+    context.get().serialPort.receive('Kani-Board, Please push Enter key to mrbwrite mode\r\n');
+    await advance(t, 1000);
+    await advance(t, 1000);
+    assert.equal(await restart, true);
+    assert.equal(context.get().running, 0);
+  });
+
+  it('Restartの再open中のCancelで遅いopen成功も回収すること', async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+    let release;
+    const Base = createSerialPort({ ports: [{ path: '/dev/x' }] });
+    class SerialPort extends Base {
+      constructor(options, callback) {
+        super(options, (error) => {
+          if (Base.instances.length === 1) callback(error);
+          else release = () => callback(error);
+        });
+      }
+    }
+    const context = createContext({ SerialPort });
+    await main.connect(context, '/dev/x', 9600);
+    context.enterCommandMode();
+    const result = main.restartAndReconnect(context);
+    context.get().serialPort.listeners.close();
+    await advance(t, 1000);
+    assert.equal(context.get().operation.phase, 'opening');
+    main.cancelConnection(context);
+    await flush();
+    release();
+    await advance(t, 1000);
+    assert.equal(await result, false);
+    assert.equal(context.get().serialPort, null);
+    assert.equal(Base.instances[1].closed, true);
+    assert.equal(main.canAction(context, 'Connect'), true);
+  });
+
+  it('古いポートのcloseとdataで新しい接続を変更しないこと', async () => {
+    const context = createContext();
+    await main.connect(context, '/dev/x', 9600);
+    const old = context.get().serialPort;
+    await main.disconnect(context);
+    await main.connect(context, '/dev/x', 9600);
+    const port = context.get().serialPort;
+    context.enterCommandMode();
+    old.listeners.close();
+    old.receive('Kani-Board, End mrbwrite mode\r\n');
+    assert.equal(context.get().serialPort, port);
+    assert.equal(context.get().commandMode, true);
+  });
+
+  it('open期限超過後に成功しても接続状態を復活させないこと', async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+    let release;
+    const Base = createSerialPort();
+    class SerialPort extends Base {
+      constructor(options, callback) { super(options, (error) => { release = () => callback(error); }); }
+    }
+    const context = createContext({ SerialPort });
+    const result = assert.rejects(main.connect(context, '/dev/x', 9600), /timed out/);
+    await advance(t, 5000);
+    await result;
+    release();
+    await flush();
+    assert.equal(context.get().serialPort, null);
+    assert.equal(Base.instances[0].closed, true);
+  });
+
+  it('Breakアサート失敗時も解除を試み、失敗を返すこと', async () => {
+    const context = createContext();
+    await main.connect(context, '/dev/x', 9600);
+    const port = context.get().serialPort;
+    port.set = (options, callback) => {
+      port.sets.push(options);
+      callback(options.brk ? new Error('Break failed') : null);
+    };
+    await assert.rejects(main.sendBreak(context), /Break failed/);
+    assert.deepEqual(port.sets.map((options) => options.brk), [false, true, false]);
+  });
+
+  it('Execute待機中はCancel・Writeを無効にし、version応答を成功としないこと', async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+    const context = createContext({ SerialPort: createSerialPort({ device: () => '' }) });
+    await main.connect(context, '/dev/x', 9600);
+    context.enterCommandMode();
+    const port = context.get().serialPort;
+    const result = main.runAction(context, () => main.execute(context), 'execute');
+    port.receive('+OK mruby/c v3.4 RITE0300 MRBW1.2\r\n');
+    assert.equal(main.canAction(context, 'Cancel'), false);
+    assert.equal(main.canAction(context, 'Write'), false);
+    assert.equal(main.canAction(context, 'Disconnect'), true);
+    assert.equal(context.get().commandMode, true);
+    port.receive('-ERR Illegal command.\r\n');
+    await result;
+    port.receive('+OK\r\n');
+    assert.equal(context.get().commandMode, true);
+    assert.equal(context.get().lastCommand, null);
+  });
+
+  it('中止済みの応答タイマーで新しい待機を消さないこと', async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+    const context = createContext();
+    const old = main.waitForResponse(context, 1000);
+    main.resetProtocol(context);
+    const next = main.waitForResponse(context, 5000);
+    await advance(t, 1000);
+    main.feed(context, encode('+OK\r\n'));
+    assert.equal(await old, null);
+    assert.equal(await next, '+OK');
+  });
+
+  it('ポート一覧が応答しなくてもRestart復旧の期限で終了すること', async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+    const context = createContext();
+    await main.connect(context, '/dev/x', 9600);
+    context.enterCommandMode();
+    const result = main.restartAndReconnect(context);
+    context.get().serialPort.listeners.close();
+    context.SerialPort.list = () => new Promise(() => {});
+    await advance(t, 1000);
+    await advance(t, 59000);
+    assert.equal(await result, false);
+    assert.equal(context.get().operation, null);
+    assert.equal(context.get().running, 0);
+    assert.equal(main.canAction(context, 'Connect'), true);
+  });
+
+  it('close完了まではConnectを無効にすること', async () => {
+    const context = createContext();
+    await main.connect(context, '/dev/x', 9600);
+    const port = context.get().serialPort;
+    let close;
+    port.close = (callback) => { close = callback; };
+    const result = main.disconnect(context);
+    assert.equal(context.get().serialPort, port);
+    assert.equal(main.canAction(context, 'Connect'), false);
+    assert.equal(main.canAction(context, 'Disconnect'), false);
+    await flush();
+    close();
+    await result;
+    assert.equal(main.canAction(context, 'Connect'), true);
+  });
+
+  it('ポート選択中に終了した接続要求を遅い選択結果で再開しないこと', async () => {
+    let select;
+    const context = createContext({ SerialPort: createSerialPort({ ports: [{ path: '/dev/x' }] }), window: {
+      showQuickPick: () => new Promise((resolve) => { select = resolve; })
+    } });
+    const result = main.connectDevice(context);
+    await flush();
+    await main.disconnect(context);
+    select({ label: '/dev/x' });
+    await flush();
+    assert.equal(await result, false);
+    assert.equal(context.SerialPort.instances.length, 0);
+  });
+});
+
+describe('#ensureReady', () => {
+  it('未接続では暗黙に接続しないこと', async () => {
+    const context = createContext({ device: { port: '/dev/x' } });
+    assert.equal(await main.ensureReady(context), false);
+    assert.equal(context.SerialPort.instances.length, 0);
+  });
+
+  it('ポートのみ接続では暗黙にRestartしないこと', async () => {
+    const context = createContext();
+    await main.connect(context, '/dev/x', 9600);
+    assert.equal(await main.ensureReady(context), false);
+    assert.deepEqual(context.get().serialPort.written, []);
+    assert.equal(context.get().serialPort.sets.length, 1);
+  });
+
+  it('コマンド受付を確認済みならtrueを返すこと', async () => {
+    const context = createContext();
+    await main.connect(context, '/dev/x', 9600);
+    context.enterCommandMode();
+    assert.equal(await main.ensureReady(context), true);
   });
 });
 
@@ -1447,7 +2096,7 @@ describe('#pollAutoConnect', () => {
   };
 
   it('設定のポートが現れたら接続してコマンドモードへ入ること', async (t) => {
-    t.mock.timers.enable({ apis: ['setTimeout'] });
+    t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
     const context = createPollContext({ port: '/dev/x', baud: 9600 });
     const result = main.pollAutoConnect(context);
     await advance(t, 1000);
@@ -1507,7 +2156,7 @@ describe('#pollAutoConnect', () => {
   });
 
   it('有効にし直した場合はポートの出現を再確認すること', async (t) => {
-    t.mock.timers.enable({ apis: ['setTimeout'] });
+    t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
     const context = createPollContext({ port: '/dev/x' });
     context.setPortPresent(true);
     context.setAutoConnect(false);
@@ -1518,14 +2167,18 @@ describe('#pollAutoConnect', () => {
     assert.equal(context.get().serialPort.path, '/dev/x');
   });
 
-  it('接続に失敗してもエラーとして記録しないこと', async () => {
+  it('接続に失敗しても共通期限まで再試行し、エラーとして記録しないこと', async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
     const context = createContext({
       device: { port: '/dev/x' },
       SerialPort: createSerialPort({ ports: [{ path: '/dev/x' }], openError: new Error('busy') })
     });
     context.setAutoConnect(true);
-    await main.pollAutoConnect(context);
+    const result = main.pollAutoConnect(context);
+    for (let second = 0; second < 60; second++) await advance(t, 1000);
+    await result;
     assert.equal(context.get().serialPort, null);
+    assert.equal(context.SerialPort.instances.length, 60);
     assert.ok(!context.output.lines.some((line) => line.startsWith('[error]')));
   });
 });
@@ -1629,7 +2282,7 @@ describe('#buildDeviceView', () => {
   });
 
   it('自動判定の警告をチェックボックス付近とホバーに表示すること', async () => {
-    const context = createContext({ root });
+    const context = createContext({ root, window: { activeTextEditor: { document: document('/main.rb', 'puts 1') } } });
     await main.connect(context, '/dev/x', 9600);
     context.enterCommandMode();
     context.setBoardInfo(main.parseBoardInfo('+OK mruby/c v3.3 RITE9999'));
@@ -1704,14 +2357,14 @@ describe('#refreshButtons', () => {
   beforeEach(() => { root = makeWorkspace(); });
   afterEach(() => fs.rmSync(root, { recursive: true }));
 
-  it('未接続ではConnectとCompileだけ押せること', () => {
+  it('未接続ではConnectだけ押せること', () => {
     const context = createContext({ root });
     main.refreshButtons(context);
     assert.deepEqual(contextValues(context), {
       'kaniburner.connected': false,
-      'kaniburner.canCompile': true, 'kaniburner.canConnect': true,
+      'kaniburner.canCompile': false, 'kaniburner.canConnect': true, 'kaniburner.canCancel': false,
       'kaniburner.canDisconnect': false, 'kaniburner.canWrite': false, 'kaniburner.canExecute': false,
-      'kaniburner.canReset': false
+      'kaniburner.canRestart': false
     });
   });
 
@@ -1721,13 +2374,13 @@ describe('#refreshButtons', () => {
     main.refreshButtons(context);
     const values = contextValues(context);
     assert.equal(values['kaniburner.canCompile'], false);
-    assert.equal(values['kaniburner.canReset'], true);
+    assert.equal(values['kaniburner.canRestart'], true);
     assert.equal(values['kaniburner.canWrite'], false);
     assert.equal(values['kaniburner.canExecute'], false);
   });
 
   it('コマンドモードではWriteとExecuteを押せること', async () => {
-    const context = createContext({ root });
+    const context = createContext({ root, window: { activeTextEditor: { document: document('/main.rb', 'puts 1') } } });
     await main.connect(context, '/dev/x', 9600);
     context.enterCommandMode();
     main.refreshButtons(context);
@@ -1756,6 +2409,49 @@ describe('#refreshButtons', () => {
     main.refreshButtons(context);
     const enabled = Object.entries(contextValues(context)).filter(([key, value]) => key.startsWith('kaniburner.can') && value);
     assert.deepEqual(enabled.map(([key]) => key), ['kaniburner.canDisconnect']);
+  });
+});
+
+describe('#refreshStatusBar', () => {
+  it('未接続ではOfflineを表示すること', () => {
+    const context = createContext();
+    main.refreshStatusBar(context);
+    assert.equal(context.statusBar.text, '$(debug-disconnect) kaniburner');
+    assert.equal(context.statusBar.tooltip, 'kaniburner: Offline\nBoard not connected.');
+  });
+
+  it('接続・モード変更・プロトコル初期化・切断で表示を更新すること', async () => {
+    const context = createContext();
+    await main.connect(context, '/dev/x', 9600);
+    assert.equal(context.statusBar.text, '$(plug) kaniburner');
+    assert.equal(context.statusBar.tooltip, 'kaniburner: Connected\n/dev/x (9600 baud)');
+    context.enterCommandMode();
+    assert.equal(context.statusBar.text, '$(terminal) kaniburner');
+    assert.equal(context.statusBar.tooltip, 'kaniburner: Command\n/dev/x (9600 baud)');
+    context.exitCommandMode();
+    assert.equal(context.statusBar.text, '$(plug) kaniburner');
+    context.enterCommandMode();
+    main.resetProtocol(context);
+    assert.equal(context.statusBar.text, '$(plug) kaniburner');
+    const port = context.get().serialPort;
+    port.receive('Kani-Board, mruby/c v3.3 start\r\n');
+    assert.equal(context.statusBar.text, '$(play) kaniburner');
+    context.enterCommandMode();
+    assert.equal(context.get().runMode, false);
+    assert.equal(context.statusBar.text, '$(terminal) kaniburner');
+    port.receive('Kani-Board, mruby/c v3.3 start\r\n');
+    port.receive('Kani-Board, Please push Enter key to mrbwrite mode\r\n');
+    assert.equal(context.get().runMode, false);
+    assert.equal(context.statusBar.text, '$(plug) kaniburner');
+    port.receive('Kani-Board, mruby/c v3.3 start\r\n');
+    main.resetProtocol(context);
+    assert.equal(context.get().runMode, false);
+    assert.equal(context.statusBar.text, '$(plug) kaniburner');
+    port.receive('Kani-Board, mruby/c v3.3 start\r\n');
+    context.get().serialPort.listeners.close();
+    assert.equal(context.get().runMode, false);
+    assert.equal(context.statusBar.text, '$(debug-disconnect) kaniburner');
+    assert.equal(context.statusBar.tooltip, 'kaniburner: Offline\nBoard not connected.');
   });
 });
 
@@ -1857,7 +2553,7 @@ describe('#addProjectFile', () => {
     const messages = [];
     const context = createContext({ root, window: { showInformationMessage: (message) => messages.push(message) } });
     await main.addProjectFile(context, 'tasks', [new Uri(path.join(root, 'a.txt'))]);
-    assert.deepEqual(messages, ['Kaniburner: 追加できる .rb ファイルがありません。']);
+    assert.deepEqual(messages, ['kaniburner: 追加できる .rb ファイルがありません。']);
   });
 
   it('URIが無ければ開いているタブから選ばせること', async () => {
@@ -1867,7 +2563,7 @@ describe('#addProjectFile', () => {
       showQuickPick: async (items, options) => { shown = [items, options.title]; return items[0]; }
     } });
     await main.addProjectFile(context, 'libraries', []);
-    assert.deepEqual(shown, [['lib.rb'], 'Kaniburner: Add library']);
+    assert.deepEqual(shown, [['lib.rb'], 'kaniburner: Add library']);
     assert.deepEqual(readProjectConfig(root).libraries, [{ filename: 'lib.rb' }]);
   });
 
@@ -1878,7 +2574,7 @@ describe('#addProjectFile', () => {
       showInformationMessage: (message) => messages.push(message)
     } });
     await main.addProjectFile(context, 'tasks', []);
-    assert.deepEqual(messages, ['Kaniburner: 追加できる未登録の .rb タブがありません。']);
+    assert.deepEqual(messages, ['kaniburner: 追加できる未登録の .rb タブがありません。']);
   });
 });
 
@@ -1929,7 +2625,9 @@ describe('#activate', () => {
     const root = makeWorkspace();
     t.after(() => fs.rmSync(root, { recursive: true }));
     for (const version of ['3.4.0', '4.0.0']) installMrbc(path.join(root, 'media', `mruby-${version}`));
-    const context = createContext({ root, extensionPath: root, device: { port: '/dev/x' }, window: {
+    let reply = true;
+    const context = createContext({ root, extensionPath: root, device: { port: '/dev/x' },
+      SerialPort: createSerialPort({ device: (text) => reply ? mrbwriteDevice(text) : '' }), window: {
       activeTextEditor: { document: document(path.join(root, 'main.rb'), 'task') }
     } });
     const api = context.vscode;
@@ -1938,6 +2636,11 @@ describe('#activate', () => {
     let deviceProvider, changeCheckbox;
     context.output.dispose = () => {};
     api.window.createOutputChannel = () => context.output;
+    api.window.createStatusBarItem = (id, alignment) => {
+      assert.equal(id, 'kaniburner.connection');
+      assert.equal(alignment, api.StatusBarAlignment.Left);
+      return context.statusBar;
+    };
     api.window.onDidChangeActiveTextEditor = () => disposable;
     api.window.registerTreeDataProvider = () => disposable;
     api.window.createTreeView = (_, { treeDataProvider }) => {
@@ -1957,6 +2660,13 @@ describe('#activate', () => {
     });
     const extensionContext = { extensionPath: root, workspaceState: context.storage, subscriptions: [] };
     main.activate(extensionContext);
+    assert.equal(context.statusBar.name, 'kaniburner');
+    assert.deepEqual(context.statusBar.command, {
+      command: 'workbench.action.quickOpen', title: 'kaniburner commands', arguments: ['>kaniburner: ']
+    });
+    assert.equal(context.statusBar.shown, 1);
+    assert.equal(context.statusBar.text, '$(debug-disconnect) kaniburner');
+    assert.ok(extensionContext.subscriptions.includes(context.statusBar));
     t.after(async () => {
       await main.deactivate();
       for (const subscription of extensionContext.subscriptions) subscription.dispose();
@@ -1976,14 +2686,15 @@ describe('#activate', () => {
     assert.deepEqual(context.storage.data['kaniburner.device'], { port: '/dev/x' });
     changeCheckbox({ items: [[item('deviceAutoConnect'), 0]] });
     assert.equal(item('deviceAutoConnect').checkboxState, 0);
-    await registered.get('kaniburner.compile')();
+    assert.equal(registered.has('kaniburner.compile'), false);
+    await registered.get('kaniburner.write')();
     assert.equal(context.SerialPort.instances.length, 0);
-    assert.ok(context.output.lines.includes('[info]  Compile succeeded. (4 bytes)'));
 
     const connection = registered.get('kaniburner.connect')();
     await advance(t, 1000);
     await connection;
     assert.equal(contextValues(context)['kaniburner.connected'], true);
+    assert.equal(context.statusBar.text, '$(terminal) kaniburner');
     assert.equal(contextValues(context)['kaniburner.canCompile'], false);
     assert.equal(contextValues(context)['kaniburner.canWrite'], true);
     assert.equal(item('deviceVmVersion').description, 'v3.3');
@@ -2003,8 +2714,26 @@ describe('#activate', () => {
     assert.equal(port.written.at(-1), 'task');
     assert.ok(!port.written.includes('execute\r\n'));
     await registered.get('kaniburner.disconnect')();
-    assert.equal(contextValues(context)['kaniburner.canCompile'], true);
+    assert.equal(contextValues(context)['kaniburner.canCompile'], false);
     assert.equal(contextValues(context)['kaniburner.canWrite'], false);
     assert.equal(item('deviceVmVersion').description, '(not connected)');
+    assert.equal(context.statusBar.text, '$(debug-disconnect) kaniburner');
+
+    reply = false;
+    const retry = registered.get('kaniburner.connect')();
+    await flush();
+    const probingPort = context.SerialPort.instances.at(-1);
+    assert.equal(contextValues(context)['kaniburner.canCancel'], true);
+    assert.equal(contextValues(context)['kaniburner.canDisconnect'], false);
+    await registered.get('kaniburner.disconnect')();
+    assert.equal(probingPort.closed, false);
+    assert.equal(contextValues(context)['kaniburner.connected'], true);
+    registered.get('kaniburner.cancel')();
+    assert.equal(await retry, undefined);
+    assert.equal(contextValues(context)['kaniburner.canCancel'], false);
+    assert.equal(contextValues(context)['kaniburner.canDisconnect'], true);
+    await registered.get('kaniburner.disconnect')();
+    assert.equal(probingPort.closed, true);
+    assert.equal(contextValues(context)['kaniburner.connected'], false);
   });
 });
