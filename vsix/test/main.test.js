@@ -358,7 +358,7 @@ describe('#ensureCommandMode', () => {
       '[info]  Entering command mode... (1/2)',
       '[info]  Entering command mode... (2/2)'
     ]);
-    assert.ok(context.output.lines.includes('[error] Command mode transition timed out (2s).'));
+    assert.ok(context.output.lines.includes('[error] Command mode transition failed after 2 attempts.'));
   });
 
   it('未接続では確立を試行しないこと', async () => {
@@ -1584,9 +1584,13 @@ describe('#restartAndReconnect', () => {
     const result = main.restartAndReconnect(context);
     await flush();
     context.get().serialPort.listeners.close();
-    for (let second = 0; second < 60; second++) await advance(t, 1000);
+    await advance(t, 1000);
+    for (let attempt = 0; attempt < 30; attempt++) await advance(t, 1000);
     assert.equal(await result, false);
     assert.equal(context.SerialPort.instances.length, 1);
+    assert.equal(context.output.lines.filter((line) => line.includes('Listing ports')).length, 30);
+    assert.ok(context.output.lines.includes('[info]  Listing ports (/dev/x)... (30/30)'));
+    assert.ok(context.output.lines.includes('[error] Connection failed after 30 attempts.'));
   });
 });
 
@@ -1623,12 +1627,34 @@ describe('#connectionLifecycle', () => {
     const result = main.connectDevice(context);
     await advance(t, 5000);
     assert.deepEqual(context.get().serialPort.written, ['\r\n', '\r\n']);
-    assert.ok(context.output.lines.includes('[info]  Entering command mode... (5/60s)'));
+    assert.ok(context.output.lines.includes('[info]  Entering command mode... (2/30)'));
     assert.ok(!context.output.lines.some((line) => line.startsWith('[error]')));
     assert.equal(main.canAction(context, 'Disconnect'), false);
     main.cancelConnection(context);
     assert.equal(await result, false);
     assert.equal(main.canAction(context, 'Disconnect'), true);
+  });
+
+  it('送信タイムアウトが続いても30回試行して終了すること', async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+    const Base = createSerialPort();
+    class SerialPort extends Base {
+      write(buffer) { this.written.push(buffer.toString('latin1')); }
+    }
+    const context = createContext({ device: { port: '/dev/x' }, SerialPort });
+    const result = main.connectDevice(context);
+    for (let attempt = 0; attempt < 29; attempt++) await advance(t, 5000);
+    const port = context.get().serialPort;
+    assert.equal(port.written.length, 30);
+    assert.equal(main.canAction(context, 'Cancel'), true);
+    assert.ok(context.output.lines.includes('[info]  Entering command mode... (30/30)'));
+    assert.ok(!context.output.lines.some((line) => line.startsWith('[error]')));
+    await advance(t, 5000);
+    assert.equal(await result, false);
+    assert.equal(context.get().operation, null);
+    assert.ok(context.output.lines.includes('[error] Connection failed after 30 attempts.'));
+    await advance(t, 5000);
+    assert.equal(port.written.length, 30);
   });
 
   it('Restart検証中の送信タイムアウトは記録せず、Cancel後にDisconnectを許可すること', async (t) => {
@@ -1643,7 +1669,7 @@ describe('#connectionLifecycle', () => {
     await advance(t, 1000);
     await advance(t, 5000);
     assert.deepEqual(port.written, ['\r\n', '\r\n']);
-    assert.ok(context.output.lines.includes('[info]  Entering command mode... (6/60s)'));
+    assert.ok(context.output.lines.includes('[info]  Entering command mode... (2/30)'));
     assert.ok(!context.output.lines.some((line) => line.startsWith('[error]')));
     assert.equal(main.canAction(context, 'Cancel'), true);
     assert.equal(main.canAction(context, 'Disconnect'), false);
@@ -1740,7 +1766,7 @@ describe('#connectionLifecycle', () => {
     await advance(t, 1000);
     assert.equal(lists, 3);
     assert.equal(context.output.lines.filter((line) => line.includes('Listing ports')).length, lists);
-    assert.ok(context.output.lines.some((line) => line.includes('(2/60s)')));
+    assert.ok(context.output.lines.includes('[info]  Listing ports (/dev/x)... (3/30)'));
     assert.equal(main.canAction(context, 'Cancel'), true);
     main.cancelConnection(context);
     await advance(t, 1000);
@@ -1748,6 +1774,25 @@ describe('#connectionLifecycle', () => {
     assert.equal(lists, 3);
     assert.equal(context.get().serialPort, null);
     assert.equal(main.canAction(context, 'Connect'), true);
+  });
+
+  it('一覧取得に時間がかかっても30回目で接続できること', async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+    const context = createContext({ device: { port: '/dev/x' } });
+    let lists = 0;
+    context.SerialPort.list = () => {
+      lists++;
+      return new Promise((resolve) => setTimeout(() => resolve(lists === 30 ? [{ path: '/dev/x' }] : []), 2000));
+    };
+    const result = main.connectDevice(context);
+    for (let attempt = 0; attempt < 30; attempt++) await advance(t, 2000);
+    await advance(t, 1000);
+    assert.equal(await result, true);
+    assert.equal(lists, 30);
+    assert.equal(context.get().commandMode, true);
+    assert.ok(context.output.lines.includes('[info]  Listing ports (/dev/x)... (30/30)'));
+    assert.ok(context.output.lines.includes('[info]  Entering command mode... (30/30)'));
+    assert.ok(!context.output.lines.some((line) => line.startsWith('[error]')));
   });
 
   it('Connectのopen待ちもCancelでき、遅い成功を回収すること', async (t) => {
@@ -1770,13 +1815,19 @@ describe('#connectionLifecycle', () => {
     assert.equal(Base.instances[0].closed, true);
   });
 
-  it('Connectのlistが応答しなくても共通の60秒期限で終了すること', async (t) => {
+  it('Connectのlist待ちをCancelでき、遅い取得結果で接続を始めないこと', async (t) => {
     t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
     const context = createContext({ device: { port: '/dev/x' } });
-    context.SerialPort.list = () => new Promise(() => {});
+    let release;
+    context.SerialPort.list = () => new Promise((resolve) => { release = resolve; });
     const result = main.connectDevice(context);
-    await advance(t, 60000);
+    await advance(t, 30000);
+    assert.equal(main.canAction(context, 'Cancel'), true);
+    main.cancelConnection(context);
     assert.equal(await result, false);
+    release([{ path: '/dev/x' }]);
+    await flush();
+    assert.equal(context.SerialPort.instances.length, 0);
     assert.equal(context.get().operation, null);
     assert.equal(main.canAction(context, 'Connect'), true);
   });
@@ -1808,16 +1859,18 @@ describe('#connectionLifecycle', () => {
     assert.ok(context.output.lines.includes('[error] Connect failed: busy'));
   });
 
-  it('検証と再openを往復してもConnectの期限を延長しないこと', async (t) => {
+  it('検証と再openを往復しても合計30回で終了すること', async (t) => {
     t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
     const context = createContext({ device: { port: '/dev/x' }, SerialPort: createSerialPort({ device: () => '' }) });
     const result = main.connectDevice(context);
-    for (let second = 0; second < 60; second++) {
-      if (second === 20 || second === 40) context.get().serialPort.listeners.close();
+    for (let attempt = 0; attempt < 30; attempt++) {
+      if (attempt === 10 || attempt === 20) context.get().serialPort.listeners.close();
       await advance(t, 1000);
     }
     assert.equal(await result, false);
     assert.equal(context.SerialPort.instances.length, 3);
+    assert.equal(context.SerialPort.instances.reduce((count, port) => count + port.written.length, 0), 30);
+    assert.ok(context.output.lines.includes('[info]  Entering command mode... (30/30)'));
     assert.notEqual(context.get().serialPort, null);
     assert.equal(context.get().commandMode, false);
     assert.equal(main.canAction(context, 'Restart'), true);
@@ -1993,17 +2046,23 @@ describe('#connectionLifecycle', () => {
     assert.equal(await next, '+OK');
   });
 
-  it('ポート一覧が応答しなくてもRestart復旧の期限で終了すること', async (t) => {
+  it('Restartのlist待ちをCancelでき、遅い取得結果で再接続しないこと', async (t) => {
     t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
     const context = createContext();
     await main.connect(context, '/dev/x', 9600);
     context.enterCommandMode();
     const result = main.restartAndReconnect(context);
     context.get().serialPort.listeners.close();
-    context.SerialPort.list = () => new Promise(() => {});
+    let release;
+    context.SerialPort.list = () => new Promise((resolve) => { release = resolve; });
     await advance(t, 1000);
-    await advance(t, 59000);
+    await advance(t, 30000);
+    assert.equal(main.canAction(context, 'Cancel'), true);
+    main.cancelConnection(context);
     assert.equal(await result, false);
+    release([{ path: '/dev/x' }]);
+    await flush();
+    assert.equal(context.SerialPort.instances.length, 1);
     assert.equal(context.get().operation, null);
     assert.equal(context.get().running, 0);
     assert.equal(main.canAction(context, 'Connect'), true);
@@ -2167,7 +2226,7 @@ describe('#pollAutoConnect', () => {
     assert.equal(context.get().serialPort.path, '/dev/x');
   });
 
-  it('接続に失敗しても共通期限まで再試行し、エラーとして記録しないこと', async (t) => {
+  it('接続に失敗しても30回まで再試行し、エラーとして記録しないこと', async (t) => {
     t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
     const context = createContext({
       device: { port: '/dev/x' },
@@ -2175,10 +2234,10 @@ describe('#pollAutoConnect', () => {
     });
     context.setAutoConnect(true);
     const result = main.pollAutoConnect(context);
-    for (let second = 0; second < 60; second++) await advance(t, 1000);
+    for (let attempt = 0; attempt < 30; attempt++) await advance(t, 1000);
     await result;
     assert.equal(context.get().serialPort, null);
-    assert.equal(context.SerialPort.instances.length, 60);
+    assert.equal(context.SerialPort.instances.length, 30);
     assert.ok(!context.output.lines.some((line) => line.startsWith('[error]')));
   });
 });

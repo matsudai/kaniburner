@@ -13,7 +13,7 @@ const RITE_COMPILERS: Record<string, string> = { RITE0300: '3.4.0', RITE0400: '4
 const DEFAULT_VERSION = '4.0.0';
 const DEFAULT_BAUD = 115200;
 const PROJECT_CONFIG_FILENAME = '.vscode/kaniburner.json';
-const CONNECT_TIMEOUT = 60000;
+const CONNECT_RETRIES = 30;
 const OPEN_TIMEOUT = 5000;
 const WRITE_TIMEOUT = 5000;
 const DISCONNECT_WAIT_TIMEOUT = 500;
@@ -356,7 +356,7 @@ export async function sendCommand(context: Context, command: string, { ignoreRes
  *
  * @return コマンドモードへ遷移できたかどうか。
  */
-export async function ensureCommandMode(context: Context, retries = 30, progress?: string): Promise<boolean> {
+export async function ensureCommandMode(context: Context, retries = CONNECT_RETRIES, progress?: string): Promise<boolean> {
   if (context.get().commandMode) return true;
   const { serialPort: port, operation } = context.get();
   if (!port) return false;
@@ -372,7 +372,7 @@ export async function ensureCommandMode(context: Context, retries = 30, progress
       if (!active(context, operation) || context.get().serialPort !== port) return false;
       if (context.get().commandMode) return true;
     }
-    if (retries > 1) logError(context, `Command mode transition timed out (${retries}s).`);
+    if (retries > 1) logError(context, `Command mode transition failed after ${retries} attempts.`);
     return false;
   } catch (error) {
     const message = (error as Error).message;
@@ -1095,13 +1095,6 @@ export async function restartAndReconnect(context: Context): Promise<boolean> {
 async function establishDevice(context: Context, portPath: string, baud: number, quiet = false, restart?: boolean): Promise<boolean> {
   const { operation } = context.get();
   if (!operation) return false;
-  const started = Date.now();
-  const progress = () => `${Math.floor((Date.now() - started) / 1000)}/${CONNECT_TIMEOUT / 1000}s`;
-  const timer = setTimeout(() => {
-    if (context.get().operation !== operation || operation.phase === 'info') return;
-    stopOperation(context);
-    if (!quiet) logError(context, `Connection attempt timed out (${CONNECT_TIMEOUT / 1000}s).`);
-  }, CONNECT_TIMEOUT);
   resetProtocol(context);
   try {
     if (restart !== undefined) {
@@ -1124,11 +1117,11 @@ async function establishDevice(context: Context, portPath: string, baud: number,
       context.setPhase(connected(context) ? 'probing' : 'waiting');
       await sleep(CONNECT_INTERVAL, operation.controller.signal);
     }
-    while (active(context, operation)) {
-      const attempt = Date.now();
+    for (let attempt = 0; attempt < CONNECT_RETRIES && active(context, operation); attempt++) {
+      const started = Date.now();
       if (!connected(context)) {
         context.setPhase('waiting');
-        logInfo(context, `Listing ports (${portPath})... (${progress()})`);
+        logInfo(context, `Listing ports (${portPath})... (${attempt + 1}/${CONNECT_RETRIES})`);
         try {
           const ports = await context.SerialPort.list();
           if (!active(context, operation)) break;
@@ -1145,16 +1138,16 @@ async function establishDevice(context: Context, portPath: string, baud: number,
       }
       if (active(context, operation) && connected(context)) {
         context.setPhase('probing');
-        if (await ensureCommandMode(context, 1, progress()) && active(context, operation) && connected(context)) {
-          clearTimeout(timer);
+        if (await ensureCommandMode(context, 1, `${attempt + 1}/${CONNECT_RETRIES}`) && active(context, operation) && connected(context)) {
           context.setPhase('info');
           await readBoardInfo(context);
           return active(context, operation) && connected(context) && context.get().commandMode;
         }
       }
-      const delay = CONNECT_INTERVAL - (Date.now() - attempt);
+      const delay = CONNECT_INTERVAL - (Date.now() - started);
       if (delay > 0) await sleep(delay, operation.controller.signal);
     }
+    if (!quiet && active(context, operation)) logError(context, `Connection failed after ${CONNECT_RETRIES} attempts.`);
     return false;
   } catch (error) {
     if (active(context, operation)) {
@@ -1162,12 +1155,10 @@ async function establishDevice(context: Context, portPath: string, baud: number,
       logError(context, `Connection failed: ${(error as Error).message}`);
     }
     return false;
-  } finally {
-    clearTimeout(timer);
   }
 }
 
-export async function prepareDevice(context: Context, retries = 30): Promise<boolean> {
+export async function prepareDevice(context: Context, retries = CONNECT_RETRIES): Promise<boolean> {
   const { operation } = context.get();
   if (!await ensureCommandMode(context, retries) || !active(context, operation)) return false;
   context.setPhase('info');
