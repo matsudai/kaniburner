@@ -1395,6 +1395,7 @@ export async function runAction<T>(context: Context, action: (operation: Operati
   context.beginAction();
   context.setOperation(operation);
   context.output.show(true);
+  context.vscode.commands.executeCommand('setContext', 'outputView.scrollLock', false);
   let cancel: () => void;
   const cancelled = new Promise<undefined>((resolve) => {
     cancel = () => resolve(undefined);
