@@ -332,7 +332,7 @@ describe('接続の状態遷移', () => {
       const result = main.connectDevice(h.context);
       await flush();
       if (failure === 'error') sent(new Error('write failed'));
-      else await h.clock.advance(5000);
+      else await h.clock.advance(60000);
       assert.equal(await result, false);
       assert.equal(h.context.get().mode, 'unknown');
       assert.equal(h.context.get().operation, null);
@@ -349,7 +349,7 @@ describe('接続の状態遷移', () => {
       } });
       if (failure === 'list') h.serial.list = async () => { h.serial.listCalls++; throw new Error('denied'); };
       const result = main.connectDevice(h.context);
-      await h.clock.advance(failure === 'write' ? 180000 : 30000);
+      await h.clock.advance(failure === 'write' ? 1830000 : 30000);
       assert.equal(await result, false);
       assert.equal(['probe', 'write'].includes(failure) ? texts(h.port).length : h.serial.listCalls, 30);
       assert.equal(h.context.get().operation, null);
@@ -461,24 +461,15 @@ describe('接続の状態遷移', () => {
 });
 
 describe('受信と要求の所有権', () => {
-  it('openの制御信号設定が失敗した候補ポートを閉じること', async () => {
-    const h = createHarness({ serialOptions: { set(port, signals, callback) { callback(new Error('set failed')); } } });
-    await assert.rejects(main.connect(h.context, '/dev/x', 9600), /set failed/);
-    assert.equal(h.port.isOpen, false);
+  it('Connectでは制御信号を送らずopen完了時に接続を採用すること', async () => {
+    const h = createHarness({ serialOptions: { manualOpen: true } });
+    const connecting = main.connect(h.context, '/dev/x', 9600);
     assert.equal(h.context.get().connection, null);
-  });
-
-  it('終了後の遅い制御信号設定完了でポートを採用しないこと', async () => {
-    let set;
-    const h = createHarness({ serialOptions: { set(port, signals, callback) { set = callback; } } });
-    const connecting = main.connectDevice(h.context);
-    await flush();
-    main.cancelConnection(h.context);
-    assert.equal(await connecting, false);
-    set(null);
-    await flush();
-    assert.equal(h.context.get().connection, null);
-    assert.equal(h.port.isOpen, false);
+    assert.deepEqual(h.port.sets, []);
+    h.port.opened();
+    await connecting;
+    assert.equal(h.context.get().connection.path, '/dev/x');
+    assert.deepEqual(h.port.sets, []);
   });
 
   it('古い応答タイマーで新しい待機を解除しないこと', async () => {
@@ -506,11 +497,11 @@ describe('受信と要求の所有権', () => {
     assert.equal(await first, '+OK');
   });
 
-  it('通常writeは500msを越えても5秒までは完了を待つこと', async () => {
+  it('通常writeは500msを越えても60秒までは完了を待つこと', async () => {
     const h = createHarness({ serialOptions: { write() {} } });
     await main.connect(h.context, '/dev/x', 9600);
     const result = assert.rejects(main.write(h.context, Uint8Array.of(1)), /timed out/);
-    await h.clock.advance(4999);
+    await h.clock.advance(59999);
     assert.equal(h.clock.timers.size, 1);
     await h.clock.advance(1);
     await result;
@@ -582,7 +573,7 @@ describe('受信と要求の所有権', () => {
     it(`version失敗でもcommandと手動コンパイラを使えること ${JSON.stringify(reply)}`, async () => {
       const h = createHarness({ serialOptions: { device: (text) => text === 'version\r\n' ? reply : mrbwriteDevice(text) } });
       const result = main.connectDevice(h.context);
-      await h.clock.advance(6000);
+      await h.clock.advance(61000);
       assert.equal(await result, true);
       assert.equal(h.context.get().mode, 'command');
       assert.ok(h.context.get().boardInfo.error);
@@ -692,12 +683,12 @@ describe('書込みと実行', () => {
     }
   }
 
-  it('DONEは10秒待ち、結果不明でもbinaryやCRLFを再送しないこと', async () => {
+  it('DONEは60秒待ち、結果不明でもbinaryやCRLFを再送しないこと', async () => {
     const h = createHarness();
     await h.ready();
     h.serial.device = (text) => text === '\x01' ? '' : mrbwriteDevice(text);
     const result = main.writeBytecodes(h.context, { libraries: [], tasks: [Uint8Array.of(1)] });
-    await h.clock.advance(9999);
+    await h.clock.advance(59999);
     assert.ok(h.context.runtime.request);
     await h.clock.advance(1);
     assert.equal(await result, false);
@@ -737,12 +728,12 @@ describe('書込みと実行', () => {
     assert.equal(h.context.get().mode, 'command');
   });
 
-  it('execute待ちにversion応答を使わず5秒後unknownにすること', async () => {
+  it('execute待ちにversion応答を使わず60秒後unknownにすること', async () => {
     const h = createHarness();
     await h.ready();
     h.serial.device = () => '+OK mruby/c v3.3 RITE0300\r\n';
     const result = main.execute(h.context);
-    await h.clock.advance(4999);
+    await h.clock.advance(59999);
     assert.equal(main.canAction(h.context, 'Cancel'), false);
     assert.equal(main.canAction(h.context, 'Disconnect'), true);
     assert.equal(h.context.get().mode, 'command');
@@ -803,18 +794,18 @@ describe('Restart・Disconnect・終了', () => {
     await first;
     const second = main.sendBreak(h.context);
     await flush();
-    assert.deepEqual(h.port.sets.map(({ brk }) => brk), [false, true]);
+    assert.deepEqual(h.port.sets.map(({ brk }) => brk), [true]);
     callbacks.shift()(null);
     await h.clock.advance(100);
-    assert.deepEqual(h.port.sets.map(({ brk }) => brk), [false, true, false]);
+    assert.deepEqual(h.port.sets.map(({ brk }) => brk), [true, false]);
     callbacks.shift()(null);
     await flush();
-    assert.deepEqual(h.port.sets.map(({ brk }) => brk), [false, true, false, true]);
+    assert.deepEqual(h.port.sets.map(({ brk }) => brk), [true, false, true]);
     callbacks.shift()(null);
     await h.clock.advance(100);
     callbacks.shift()(null);
     await second;
-    assert.deepEqual(h.port.sets.map(({ brk }) => brk), [false, true, false, true, false]);
+    assert.deepEqual(h.port.sets.map(({ brk }) => brk), [true, false, true, false]);
   });
 
   it('再確立のopen中にCancelした後の成功を回収すること', async () => {
@@ -887,9 +878,9 @@ describe('Restart・Disconnect・終了', () => {
     await main.connect(h.context, '/dev/x', 9600);
     const result = main.restartAndReconnect(h.context);
     await h.clock.advance(99);
-    assert.deepEqual(h.port.sets.map((signals) => signals.brk), [false, true]);
+    assert.deepEqual(h.port.sets.map((signals) => signals.brk), [true]);
     await h.clock.advance(1);
-    assert.deepEqual(h.port.sets.map((signals) => signals.brk), [false, true, false]);
+    assert.deepEqual(h.port.sets.map((signals) => signals.brk), [true, false]);
     await h.clock.advance(2000);
     assert.equal(await result, true);
   });
@@ -899,7 +890,7 @@ describe('Restart・Disconnect・終了', () => {
     await main.connect(h.context, '/dev/x', 9600);
     h.port.set = (signals, callback) => { h.port.sets.push(signals); callback(signals.brk ? new Error('Break failed') : null); };
     await assert.rejects(main.sendBreak(h.context), /Break failed/);
-    assert.deepEqual(h.port.sets.map((signals) => signals.brk), [false, true, false]);
+    assert.deepEqual(h.port.sets.map((signals) => signals.brk), [true, false]);
   });
 
   for (const response of ['-ERR reset failed\r\n', '']) {
@@ -908,7 +899,7 @@ describe('Restart・Disconnect・終了', () => {
       await h.ready();
       h.serial.device = () => response;
       const result = main.restartAndReconnect(h.context);
-      await h.clock.advance(6000);
+      await h.clock.advance(61000);
       assert.equal(await result, false);
       assert.equal(h.context.get().mode, 'unknown');
       assert.deepEqual(texts(h.port).slice(2), ['reset\r\n']);

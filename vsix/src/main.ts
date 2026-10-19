@@ -14,7 +14,7 @@ const RITE_COMPILERS: Record<string, string> = { RITE0300: '3.4.0', RITE0400: '4
 const CONNECT_RETRIES = 30;
 const CONNECT_INTERVAL = 1000;
 const OPEN_TIMEOUT = 5000;
-const WRITE_TIMEOUT = 5000;
+const WRITE_TIMEOUT = 60000;
 export const PROJECT_CONFIG_FILENAME = '.vscode/kaniburner.json';
 export type ProjectKey = 'libraries' | 'tasks';
 export type Action = 'connect' | 'restart' | 'write' | 'execute' | 'disconnect';
@@ -312,7 +312,7 @@ export function resetProtocol(context: Context, mode: State['mode'] = 'unknown')
     operation: establishing && probe ? { ...operation, phase: connected(context) ? 'probing' : 'waiting' } : operation });
   if (establishing && operation.phase === 'info' && !probe) finishOperation(context, operation.id, false);
 }
-export function waitForResponse(context: Context, timeout = 5000, accept = (_line: string) => true): Promise<string | null> {
+export function waitForResponse(context: Context, timeout = 60000, accept = (_line: string) => true): Promise<string | null> {
   if (context.runtime.request) return Promise.reject(new Error('Another response is pending.'));
   const token = owner(context);
   if (!token.sessionId || context.get().disposed) return Promise.resolve(null);
@@ -343,7 +343,7 @@ export async function sendCommand(context: Context, command: string, { ignoreRes
       ? /^\+OK mruby\/c\s+\S+/.test(line)
       : command.startsWith('write') ? line.startsWith('+OK Write bytecode')
         : command === 'reset' ? /^\+OK\s*$/.test(line) : /^\+OK(?:\s+Execute)?\s*$/.test(line));
-    const response = waitForResponse(context, 5000, accept);
+    const response = waitForResponse(context, 60000, accept);
     const request = context.runtime.request as RequestRuntime | null;
     try { await sendText(context, command + '\r\n'); }
     catch (error) { request?.finish(null); throw error; }
@@ -411,7 +411,7 @@ export async function writeBytecodes(context: Context, { libraries, tasks }: Byt
         return false;
       }
       logInfo(context, `Sending bytecode (${bytecode.length} bytes)...`);
-      const doneResponse = waitForResponse(context, 10000, (line) => line.startsWith('+DONE') || line.startsWith('-ERR'));
+      const doneResponse = waitForResponse(context, 60000, (line) => line.startsWith('+DONE') || line.startsWith('-ERR'));
       await write(context, bytecode);
       const done = await doneResponse;
       if (!valid(context, token)) return false;
@@ -483,19 +483,14 @@ export function connect(context: Context, portPath: string, baudRate: number): P
       opened = true;
       if (finished || !usable()) { discard(); finish(new Error('Connection cancelled.')); return; }
       try {
-        port.set({ brk: false, dtr: true, rts: true }, (error) => {
-          if (adopted) return;
-          if (finished || !usable()) { discard(); finish(new Error('Connection cancelled.')); return; }
-          if (error) { finish(error); return; }
-          adopted = true;
-          context.runtime.session = session;
-          context.runtime.candidates.delete(id);
-          context.runtime.protocolEpoch++;
-          context.runtime.monitorGeneration++;
-          context.transition({ ...context.get(), connection: { id, path: portPath, baud: baudRate },
-            mode: 'unknown', boardInfo: null, boardInfoLoading: false });
-          finish();
-        });
+        adopted = true;
+        context.runtime.session = session;
+        context.runtime.candidates.delete(id);
+        context.runtime.protocolEpoch++;
+        context.runtime.monitorGeneration++;
+        context.transition({ ...context.get(), connection: { id, path: portPath, baud: baudRate },
+          mode: 'unknown', boardInfo: null, boardInfoLoading: false });
+        finish();
       } catch (error) { finish(error as Error); }
     };
     try {
